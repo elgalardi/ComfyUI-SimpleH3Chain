@@ -7,24 +7,12 @@ modify the native MiniMax H3 sampling chain.
 
 from __future__ import annotations
 
-import importlib
 import os
 import re
-import sys
 from datetime import datetime
-from pathlib import Path
 
-
-_CUSTOM_NODES_DIR = str(Path(__file__).resolve().parent.parent)
-if _CUSTOM_NODES_DIR not in sys.path:
-    sys.path.insert(0, _CUSTOM_NODES_DIR)
-
-_chain = importlib.import_module(
-    "ComfyUI-MiniMaxH3-Contex-Loop.chain_nodes"
-)
-_context = importlib.import_module(
-    "ComfyUI-MiniMaxH3-Contex-Loop.nodes"
-)
+from .stable_engine import chain_nodes as _chain
+from .stable_engine import nodes as _context
 
 
 def _safe_run_name(value: str) -> str:
