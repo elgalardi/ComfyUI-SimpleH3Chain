@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import importlib
 import re
+import sys
+from pathlib import Path
 
+
+_CUSTOM_NODES_DIR = str(Path(__file__).resolve().parent.parent)
+if _CUSTOM_NODES_DIR not in sys.path:
+    sys.path.insert(0, _CUSTOM_NODES_DIR)
 
 _chain = importlib.import_module(
     "ComfyUI-MiniMaxH3-Contex-Loop.chain_nodes"
