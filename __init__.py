@@ -34,6 +34,16 @@ def _safe_run_name(value: str) -> str:
 class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
     """Small front end for the stable frame-exact chain planner."""
 
+    RETURN_TYPES = (
+        _chain.PLAN_TYPE, "STRING", "INT", "INT", "INT", "STRING"
+    )
+    RETURN_NAMES = (
+        "plan", "summary", "clip_count", "width", "height", "plan_preview"
+    )
+    OUTPUT_TOOLTIPS = _chain.MiniMaxH3ChainPlan.OUTPUT_TOOLTIPS + (
+        "Readable production plan with every scene, duration, steps, seed, and prompt.",
+    )
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -75,7 +85,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             f"simple-h3-chain-v1:{width}x{height}:"
             f"ctx={context_frames}:audio={audio_mode}"
         )
-        return super().build(
+        result = super().build(
             plan_json=plan_json_input,
             run_name=run_name,
             generation_fingerprint=fingerprint,
@@ -92,6 +102,44 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             base_seed=0,
             segment_crf=18,
         )
+        return result + (self._format_plan_preview(result[0]),)
+
+    @staticmethod
+    def _format_plan_preview(plan):
+        compatibility = plan.get("compatibility", {})
+        width = compatibility.get("width", "?")
+        height = compatibility.get("height", "?")
+        lines = [
+            "SIMPLE H3 CHAIN PLAN",
+            "=" * 58,
+            str(plan.get("summary", "")),
+            f"Resolution: {width} × {height}",
+            f"Output: {plan.get('run_name', 'h3_chain')}",
+        ]
+
+        prefix = str(plan.get("prompt_prefix") or "").strip()
+        if prefix:
+            lines.extend(["", "GLOBAL INSTRUCTIONS", "-" * 58, prefix])
+
+        for shot in plan.get("shots", []):
+            index = int(shot.get("index", 0))
+            shot_id = str(shot.get("id") or f"scene_{index:02d}")
+            duration = float(shot.get("audio_duration_seconds", 0.0))
+            steps = int(shot.get("steps", 0))
+            seed = int(shot.get("seed", 0))
+            delivered = int(shot.get("delivered_frames", 0))
+            prompt = str(shot.get("scene_prompt") or shot.get("prompt") or "").strip()
+            lines.extend([
+                "",
+                f"SCENE {index:02d} — {shot_id}",
+                "-" * 58,
+                f"Duration: {duration:.2f} s | Delivered: {delivered} frames | Steps: {steps}",
+                f"Seed: {seed}",
+                "",
+                prompt,
+            ])
+
+        return "\n".join(lines).strip()
 
 
 class SimpleH3ChainLoopStart(_chain.MiniMaxH3ChainLoopStart):
