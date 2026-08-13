@@ -8,8 +8,10 @@ modify the native MiniMax H3 sampling chain.
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -29,6 +31,47 @@ def _safe_run_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "h3_chain"))
     value = value.strip("._-")
     return value or "h3_chain"
+
+
+_DATE_TOKEN = re.compile(r"%date:([^%]+)%", re.IGNORECASE)
+
+
+def _expand_date_tokens(value: str, now=None) -> str:
+    now = now or datetime.now()
+
+    def replace(match):
+        pattern = match.group(1)
+        # Comfy-style date fields use the common yyyy/MM/dd vocabulary.
+        replacements = (
+            ("yyyy", "%Y"), ("YYYY", "%Y"),
+            ("yy", "%y"), ("YY", "%y"),
+            ("MM", "%m"), ("dd", "%d"), ("DD", "%d"),
+            ("HH", "%H"), ("hh", "%H"),
+            ("mm", "%M"), ("ss", "%S"),
+        )
+        for source, target in replacements:
+            pattern = pattern.replace(source, target)
+        try:
+            return now.strftime(pattern)
+        except ValueError:
+            return now.strftime("%Y-%m-%d")
+
+    return _DATE_TOKEN.sub(replace, str(value or "final"))
+
+
+def _versioned_final_name(manifest, requested: str) -> str:
+    expanded = _expand_date_tokens(requested)
+    base = _chain._safe_name(expanded, "final")
+    run_name = _chain._safe_name(manifest.get("run_name"), "h3_chain")
+    final_dir = os.path.join(
+        _chain._output_root(), "h3_chains", run_name, "final"
+    )
+    candidate = base
+    version = 2
+    while os.path.exists(os.path.join(final_dir, candidate + ".mp4")):
+        candidate = f"{base}_v{version}"
+        version += 1
+    return candidate
 
 
 class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
@@ -241,10 +284,11 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
         }
 
     def assemble(self, manifest, filename, source_audio=None):
+        final_name = _versioned_final_name(manifest, filename)
         return super().assemble(
             manifest=manifest,
             audio_source="plan",
-            filename=filename,
+            filename=final_name,
             audio_bitrate=256,
             source_audio=source_audio,
         )

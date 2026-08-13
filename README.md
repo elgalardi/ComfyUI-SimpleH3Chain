@@ -32,6 +32,9 @@ Additional simplifications:
 - Start / Resume accepts only the plan, starting scene, and optional source song.
 - Trim always uses 24 fps and frame-locks the audio tail.
 - Assemble follows the plan's audio mode and uses AAC 256 kbps automatically.
+- Assemble expands date tokens such as `%date:yyyy-MM-dd%` and preserves every
+  final render by adding `_v2`, `_v3`, and so on. Scene segments and their
+  transactional checkpoints keep their normal replace-by-scene behavior.
 - Current Scene, Auto Context, Save Scene, and Loop End expose only their wired
   data ports; they have no unnecessary configuration widgets.
 
