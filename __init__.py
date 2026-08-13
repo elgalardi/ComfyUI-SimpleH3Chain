@@ -145,6 +145,30 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
 class SimpleH3ChainLoopStart(_chain.MiniMaxH3ChainLoopStart):
     CATEGORY = "MiniMax H3/Simple Chain"
 
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "plan": (_chain.PLAN_TYPE, {
+                    "tooltip": "Plan from Simple H3 Chain Plan.",
+                }),
+                "start_clip": ("INT", {
+                    "default": 1, "min": 1, "max": _chain.MAX_SHOTS,
+                    "tooltip": "Use 1 for a new chain. Choose a later scene to resume from its saved predecessor.",
+                }),
+            },
+            "optional": {
+                "source_audio": ("AUDIO", {
+                    "tooltip": "Full source song when the selected audio mode uses one.",
+                }),
+            },
+            "hidden": {
+                "initial_state": (_chain.STATE_TYPE,),
+            },
+        }
+
+    DESCRIPTION = "Start a new chain or resume it from a saved scene checkpoint."
+
 
 class SimpleH3ChainCurrent(_chain.MiniMaxH3ChainCurrent):
     CATEGORY = "MiniMax H3/Simple Chain"
@@ -157,6 +181,34 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
 class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
     CATEGORY = "MiniMax H3/Simple Chain"
 
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Decoded frames from the current H3 scene.",
+                }),
+                "trim_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 4096,
+                    "tooltip": "Connect trim_frames from Simple H3 Auto Context.",
+                }),
+            },
+            "optional": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Decoded scene audio. It is trimmed and frame-locked automatically at 24 fps.",
+                }),
+            },
+        }
+
+    def trim(self, images, trim_frames, audio=None):
+        return super().trim(
+            images=images,
+            trim_frames=trim_frames,
+            audio=audio,
+            fps=24.0,
+            match_tail=True,
+        )
+
 
 class SimpleH3ChainSegmentSave(_chain.MiniMaxH3ChainSegmentSave):
     CATEGORY = "MiniMax H3/Simple Chain"
@@ -168,6 +220,36 @@ class SimpleH3ChainLoopEnd(_chain.MiniMaxH3ChainLoopEnd):
 
 class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
     CATEGORY = "MiniMax H3/Simple Chain"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "manifest": (_chain.MANIFEST_TYPE, {
+                    "tooltip": "Completed chain manifest from Simple H3 Chain End.",
+                }),
+                "filename": ("STRING", {
+                    "default": "%date:yyyy-MM-dd%",
+                    "tooltip": "Final MP4 name. Date tokens are supported.",
+                }),
+            },
+            "optional": {
+                "source_audio": ("AUDIO", {
+                    "tooltip": "Connect the full source song only when the plan uses source audio.",
+                }),
+            },
+        }
+
+    def assemble(self, manifest, filename, source_audio=None):
+        return super().assemble(
+            manifest=manifest,
+            audio_source="plan",
+            filename=filename,
+            audio_bitrate=256,
+            source_audio=source_audio,
+        )
+
+    DESCRIPTION = "Join every accepted scene and automatically follow the plan's audio mode."
 
 
 class SimpleH3ChainManifestLoad(_chain.MiniMaxH3ChainManifestLoad):
@@ -189,13 +271,13 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
-    "SimpleH3ChainLoopStart": "Simple H3 Chain Start",
-    "SimpleH3ChainCurrent": "Simple H3 Current Scene",
+    "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
+    "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
     "SimpleH3ChainContext": "Simple H3 Auto Context",
-    "SimpleH3LoopTrim": "Simple H3 Trim Overlap",
-    "SimpleH3ChainSegmentSave": "Simple H3 Save Scene",
-    "SimpleH3ChainLoopEnd": "Simple H3 Chain End",
-    "SimpleH3ChainAssemble": "Simple H3 Assemble Video",
+    "SimpleH3LoopTrim": "Simple H3 Trim + Lock Audio",
+    "SimpleH3ChainSegmentSave": "Simple H3 Save Scene + Checkpoint",
+    "SimpleH3ChainLoopEnd": "Simple H3 Loop Until Final Scene",
+    "SimpleH3ChainAssemble": "Simple H3 Assemble Final Video",
     "SimpleH3ChainManifestLoad": "Simple H3 Recover Chain",
 }
 

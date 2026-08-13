@@ -5,6 +5,10 @@ A focused MiniMax H3 scene-chain interface for the workflow used by SexyAI.
 The native H3 model, LoRA, attention, Ref2Video, sampler and decode chain stays
 unchanged. These nodes replace only the orchestration layer around it.
 
+The workflow title `H3 REF2VA — ONE REFERENCE SHEET` is the native ComfyUI
+`MiniMaxH3ReferenceToVideo` node with a custom title. It intentionally remains
+native so reference autogrow inputs and future official H3 fixes keep working.
+
 ## First test release
 
 This version uses the locally pinned stable Context Loop engine and provides
@@ -22,6 +26,14 @@ without changing or overwriting the original package.
 The tested continuity defaults are fixed internally: video context, head
 anchor, no crop, automatic audio context, CRF 18, and deterministic scene
 seeds. Scene duration and sampling steps continue to come from the JSON plan.
+
+Additional simplifications:
+
+- Start / Resume accepts only the plan, starting scene, and optional source song.
+- Trim always uses 24 fps and frame-locks the audio tail.
+- Assemble follows the plan's audio mode and uses AAC 256 kbps automatically.
+- Current Scene, Auto Context, Save Scene, and Loop End expose only their wired
+  data ports; they have no unnecessary configuration widgets.
 
 ## Dependency
 
