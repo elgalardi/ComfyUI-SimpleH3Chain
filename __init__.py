@@ -11,6 +11,9 @@ import os
 import re
 from datetime import datetime
 
+import torch
+import torch.nn.functional as F
+
 from .stable_engine import chain_nodes as _chain
 from .stable_engine import nodes as _context
 
@@ -62,6 +65,30 @@ def _versioned_final_name(manifest, requested: str) -> str:
     return candidate
 
 
+def _square_panel(image, size=512):
+    """Fit the first BHWC image into a square panel without cropping."""
+    if not torch.is_tensor(image) or image.ndim != 4 or image.shape[0] < 1:
+        raise ValueError("Continuity references must be ComfyUI IMAGE tensors.")
+    frame = image[:1].detach().to(device="cpu", dtype=torch.float32)
+    height, width = int(frame.shape[1]), int(frame.shape[2])
+    if height < 1 or width < 1:
+        raise ValueError("Continuity reference has an invalid resolution.")
+    scale = min(float(size) / width, float(size) / height)
+    new_width = max(1, round(width * scale))
+    new_height = max(1, round(height * scale))
+    frame = frame.permute(0, 3, 1, 2)
+    frame = F.interpolate(
+        frame, size=(new_height, new_width), mode="bilinear",
+        align_corners=False,
+    )
+    pad_left = (size - new_width) // 2
+    pad_right = size - new_width - pad_left
+    pad_top = (size - new_height) // 2
+    pad_bottom = size - new_height - pad_top
+    frame = F.pad(frame, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+    return frame.permute(0, 2, 3, 1).contiguous()
+
+
 class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
     """Small front end for the stable frame-exact chain planner."""
 
@@ -91,7 +118,10 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                 }),
                 "context_frames": (list(_chain.H3_CONTEXT_LENGTHS), {
                     "default": 22,
-                    "tooltip": "Frames inherited from the previous scene. 22 is the stable default.",
+                    "tooltip": (
+                        "Frames retained in disk checkpoints for recovery. Clean "
+                        "Cut mode does not inject them as motion context."
+                    ),
                 }),
                 "audio_mode": (list(_chain.AUDIO_MODES), {
                     "default": "generated_audio",
@@ -105,15 +135,15 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
 
     CATEGORY = "MiniMax H3/Simple Chain"
     DESCRIPTION = (
-        "Turn a Story Director JSON plan into a stable H3 scene chain. "
-        "Advanced continuity settings are intentionally fixed to tested values."
+        "Turn a Story Director JSON plan into independent H3 shots joined by "
+        "clean cuts and visual reference continuity."
     )
 
     def build(self, plan_json_input, width, height, context_frames,
               audio_mode, output_name):
         run_name = _safe_run_name(output_name)
         fingerprint = (
-            f"simple-h3-chain-v1:{width}x{height}:"
+            f"simple-h3-chain-v2-clean-cuts:{width}x{height}:"
             f"ctx={context_frames}:audio={audio_mode}"
         )
         result = super().build(
@@ -208,6 +238,130 @@ class SimpleH3ChainCurrent(_chain.MiniMaxH3ChainCurrent):
 class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
     CATEGORY = "MiniMax H3/Simple Chain"
 
+    DESCRIPTION = (
+        "Keep every scene independent. Previous latents are deliberately not "
+        "inserted; continuity comes from the Cut Reference Sheet instead."
+    )
+
+    def apply(self, state, conditioning, vae, latent, audio_vae=None):
+        return (_chain._prepare_native_guide_conditioning(conditioning), 0, False)
+
+
+class SimpleH3CutReferenceSheet:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "state": (_chain.STATE_TYPE, {
+                    "tooltip": "Current state from Simple H3 Current Scene.",
+                }),
+                "prompt": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "Prompt from Simple H3 Current Scene.",
+                }),
+                "identity_image": ("IMAGE", {
+                    "tooltip": (
+                        "Clean fallback image used only on scene 1, before any "
+                        "previous-scene frames exist."
+                    ),
+                }),
+                "continuity_tag": ([
+                    "<Picture 2>", "<Picture 3>", "<Picture 4>",
+                    "<Picture 5>", "<Picture 6>", "<Picture 7>",
+                    "<Picture 8>", "<Picture 9>",
+                ], {"default": "<Picture 2>"}),
+                "panel_size": ([384, 512, 640, 768], {"default": 512}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("continuity_sheet", "augmented_prompt", "status")
+    FUNCTION = "build"
+    CATEGORY = "MiniMax H3/Simple Chain"
+    DESCRIPTION = (
+        "Build a Ref2VA continuity picture from two isolated frames carried "
+        "from the previous accepted scene and append its exact tag to the prompt."
+    )
+
+    def build(self, state, prompt, identity_image, continuity_tag, panel_size):
+        size = int(panel_size)
+        previous = state.get("previous_frames")
+        panels = []
+        if torch.is_tensor(previous) and previous.ndim == 4 and previous.shape[0]:
+            panels.append(_square_panel(previous[0:1], size))
+            if previous.shape[0] > 1:
+                panels.append(_square_panel(previous[-1:], size))
+            else:
+                panels.append(_square_panel(previous[0:1], size))
+        else:
+            panels.append(_square_panel(identity_image, size))
+        sheet = torch.cat(panels, dim=2)
+        scene = int(state.get("index", 1))
+        if len(panels) == 1:
+            instruction = (
+                f"{continuity_tag} is the clean identity fallback for the first "
+                "scene; use the primary reference pictures for exact identity."
+            )
+            status = f"scene {scene}: clean fallback; no predecessor"
+        else:
+            instruction = (
+                f"{continuity_tag} contains two isolated frames from the "
+                "previously accepted scene. Preserve the current wardrobe, "
+                "hairstyle, accessories, physical changes, and persistent props "
+                "shown there, while treating this scene as a clean cinematic cut "
+                "with a new camera setup. Do not continue the previous camera "
+                "motion or copy its background unless explicitly requested."
+            )
+            status = (
+                f"scene {scene}: {len(panels)} isolated predecessor frames as "
+                f"{continuity_tag}"
+            )
+        augmented_prompt = f"{instruction}\n\n{str(prompt).strip()}"
+        return (sheet, augmented_prompt, status)
+
+
+class SimpleH3SelectContinuityFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "The complete, trimmed and accepted scene frames.",
+                }),
+                "first_position": ("FLOAT", {
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                }),
+                "second_position": ("FLOAT", {
+                    "default": 0.80, "min": 0.0, "max": 1.0, "step": 0.05,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("frames_for_loop_end", "frame_1", "frame_2", "status")
+    FUNCTION = "select"
+    CATEGORY = "MiniMax H3/Simple Chain"
+    DESCRIPTION = (
+        "Select two isolated continuity frames. Connect frames_for_loop_end to "
+        "Loop Until Final Scene; keep the original images connected to Save Scene."
+    )
+
+    def select(self, images, first_position, second_position):
+        if not torch.is_tensor(images) or images.ndim != 4 or images.shape[0] < 1:
+            raise ValueError("Continuity Frame Selector requires a non-empty IMAGE batch.")
+        count = int(images.shape[0])
+        first = round(float(first_position) * (count - 1))
+        second = round(float(second_position) * (count - 1))
+        if count > 1 and second == first:
+            second = min(count - 1, first + 1) if first < count - 1 else first - 1
+        frame_1 = images[first:first + 1].detach().to("cpu").clone()
+        frame_2 = images[second:second + 1].detach().to("cpu").clone()
+        selected = torch.cat((frame_1, frame_2), dim=0)
+        return (
+            selected, frame_1, frame_2,
+            f"selected frames {first + 1} and {second + 1} of {count}",
+        )
+
 
 class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
     CATEGORY = "MiniMax H3/Simple Chain"
@@ -293,6 +447,8 @@ NODE_CLASS_MAPPINGS = {
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
     "SimpleH3ChainContext": SimpleH3ChainContext,
+    "SimpleH3CutReferenceSheet": SimpleH3CutReferenceSheet,
+    "SimpleH3SelectContinuityFrames": SimpleH3SelectContinuityFrames,
     "SimpleH3LoopTrim": SimpleH3LoopTrim,
     "SimpleH3ChainSegmentSave": SimpleH3ChainSegmentSave,
     "SimpleH3ChainLoopEnd": SimpleH3ChainLoopEnd,
@@ -305,7 +461,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
-    "SimpleH3ChainContext": "Simple H3 Auto Context",
+    "SimpleH3ChainContext": "Simple H3 Clean Cut - No Latent Carry",
+    "SimpleH3CutReferenceSheet": "Simple H3 Cut Reference Sheet",
+    "SimpleH3SelectContinuityFrames": "Simple H3 Select Continuity Frames",
     "SimpleH3LoopTrim": "Simple H3 Trim + Lock Audio",
     "SimpleH3ChainSegmentSave": "Simple H3 Save Scene + Checkpoint",
     "SimpleH3ChainLoopEnd": "Simple H3 Loop Until Final Scene",
