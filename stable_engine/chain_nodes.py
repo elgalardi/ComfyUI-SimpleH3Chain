@@ -26,6 +26,7 @@ import subprocess
 import time
 import uuid
 import wave
+from collections.abc import Mapping
 from fractions import Fraction
 from typing import Any
 
@@ -82,8 +83,16 @@ PLAN_VERSION = 2
 MAX_SHOTS = 128
 MAX_SEED = 0xFFFFFFFFFFFFFFFF
 MAX_H3_FRAMES = 3592  # largest 17k+5 value accepted by H3's 3600-frame socket
-H3_CONTEXT_LENGTHS = (1, 5, 22, 39)
-AUDIO_MODES = ("source_track", "generated_audio", "source_plus_timeline")
+# 11 is a Simple H3 hybrid midpoint. H3's video VAE has no native 11-frame
+# temporal run, so the Simple Context node represents it as eleven consecutive
+# frame guides while preserving the same head-overlap/trim contract.
+H3_CONTEXT_LENGTHS = (1, 5, 11, 22, 39)
+AUDIO_MODES = (
+    "source_track",
+    "generated_audio",
+    "source_plus_timeline",
+    "source_intro_generated",
+)
 
 PLAN_TYPE = "H3_CHAIN_PLAN"
 STATE_TYPE = "H3_CHAIN_STATE"
@@ -93,6 +102,9 @@ MANIFEST_TYPE = "H3_CHAIN_MANIFEST"
 EXTERNAL_CONTEXT_TYPE = "H3_CHAIN_EXTERNAL_CONTEXT"
 
 _PENDING_REVIEWS: dict[str, dict[str, Any]] = {}
+_PENDING_FINAL_REVIEW_PREVIEWS: dict[
+    tuple[str, str], dict[str, Any]
+] = {}
 
 
 def _canonical_json(value: Any) -> str:
@@ -238,11 +250,11 @@ def _tensor_fingerprint(value: Any) -> str:
     return digest.hexdigest()
 
 
-def _validate_audio(audio: dict[str, Any], label: str,
+def _validate_audio(audio: Mapping[str, Any], label: str,
                     expected_frames: int | None = None) -> tuple[Any, int]:
     if torch is None:
         raise RuntimeError("H3 chain audio validation requires torch.")
-    if not isinstance(audio, dict) or "waveform" not in audio:
+    if not isinstance(audio, Mapping) or "waveform" not in audio:
         raise ValueError("%s must be a ComfyUI AUDIO value." % label)
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform) or waveform.ndim not in (1, 2, 3):
@@ -503,10 +515,25 @@ def _plan_with_external_context(
     return prepared
 
 
-def _plan_with_source_audio(plan: dict[str, Any],
-                            source_audio: dict[str, Any] | None) -> dict[str, Any]:
+def _plan_with_source_audio(
+    plan: dict[str, Any],
+    source_audio: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    source_has_no_audio = bool(
+        isinstance(source_audio, Mapping)
+        and source_audio.get("_vhs_no_audio", False)
+    )
+    if source_has_no_audio:
+        # VHS represents an audio-less video with a one-sample marker so newer
+        # ComfyUI graph inspection can safely traverse the AUDIO output. Treat
+        # it as truly absent here: H3 should synthesize audio from frame zero,
+        # not reserve an artificial silent intro or require a source track.
+        plan = dict(plan)
+        plan["compatibility"] = dict(plan["compatibility"])
+        plan["compatibility"]["audio_mode"] = "generated_audio"
+        source_audio = None
     mode = plan["compatibility"]["audio_mode"]
-    if mode in ("source_track", "source_plus_timeline"):
+    if mode in ("source_track", "source_plus_timeline", "source_intro_generated"):
         if source_audio is None:
             raise ValueError("H3 chain audio mode %s requires source_audio on "
                              "Loop Start." % mode)
@@ -515,7 +542,8 @@ def _plan_with_source_audio(plan: dict[str, Any],
         required_samples = int(round(
             int(plan["total_delivered_frames"]) / float(FPS) * sample_rate))
         silent_padding = False
-        if int(waveform.shape[-1]) < required_samples:
+        if (mode != "source_intro_generated"
+                and int(waveform.shape[-1]) < required_samples):
             if _audio_is_silent(waveform):
                 silent_padding = True
             else:
@@ -536,6 +564,24 @@ def _plan_with_source_audio(plan: dict[str, Any],
     prepared["compatibility"] = dict(plan["compatibility"])
     prepared["compatibility"]["source_audio_hash"] = source_hash
     prepared["compatibility"]["source_audio_silent_padding"] = silent_padding
+    if mode == "source_intro_generated":
+        available_seconds = int(waveform.shape[-1]) / float(sample_rate)
+        first_scene_seconds = (
+            float(plan["shots"][0].get(
+                "audio_duration_seconds",
+                int(plan["shots"][0]["raw_frames"]) / float(FPS),
+            ))
+            if plan.get("shots") else available_seconds
+        )
+        planned_intro_seconds = max(0.1, first_scene_seconds - 2.0)
+        intro_seconds = min(
+            planned_intro_seconds,
+            available_seconds,
+        )
+        prepared["compatibility"]["source_audio_intro_seconds"] = intro_seconds
+        prepared["compatibility"]["source_audio_intro_target_seconds"] = (
+            planned_intro_seconds
+        )
     if plan["compatibility"].get("external_context_hash"):
         prepared["plan_hash"] = _fingerprint({
             "prepared_plan_hash": plan["plan_hash"],
@@ -826,6 +872,40 @@ def _video_output_item(path: str) -> dict[str, str]:
         "subfolder": os.path.dirname(relative),
         "type": "output",
     }
+
+
+def _final_review_preview_key(document: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _safe_name(document.get("run_name"), "h3_chain"),
+        str(document.get("plan_hash") or ""),
+    )
+
+
+def _publish_final_review_preview(
+    manifest: dict[str, Any], final_path: str, status: str
+) -> None:
+    """Replace the last scene preview with the assembled Simple H3 video."""
+    if manifest.get("format") != "h3_chain_manifest_v3":
+        return
+    pending = _PENDING_FINAL_REVIEW_PREVIEWS.pop(
+        _final_review_preview_key(manifest), None)
+    if pending is None or PromptServer is None or PromptServer.instance is None:
+        return
+    payload = {
+        "token": pending["token"],
+        "node_id": pending["node_id"],
+        "action": "final",
+        "status": status,
+        "final_video": _video_output_item(final_path),
+    }
+    try:
+        PromptServer.instance.send_sync(
+            "simple_h3_chain_review_resolved", payload,
+            pending.get("client_id"))
+    except Exception as exc:
+        _LOG.warning(
+            "Simple H3 could not publish the assembled video to Review: %s",
+            exc)
 
 
 def _artifact_paths(plan: dict[str, Any], index: int) -> dict[str, str]:
@@ -2023,6 +2103,14 @@ class MiniMaxH3ChainLoopStart:
             state = _initial_state(
                 prepared_plan, range_start, range_end,
                 external_context=external_context if range_start == 1 else None)
+            if (range_start == 1 and prepared_plan["compatibility"]["audio_mode"]
+                    == "source_intro_generated"):
+                state["source_audio_intro"] = _slice_audio(
+                    source_audio,
+                    0.0,
+                    float(prepared_plan["compatibility"][
+                        "source_audio_intro_seconds"]),
+                )
         else:
             state = dict(initial_state)
             prepared_plan = state["plan"]
@@ -2037,6 +2125,13 @@ class MiniMaxH3ChainLoopStart:
             status += "; resumed from clip %d" % state["resumed_from"]
         if prepared_plan["compatibility"].get("source_audio_silent_padding"):
             status += "; silent source audio will be padded to the plan duration"
+        if prepared_plan["compatibility"].get("audio_mode") == "source_intro_generated":
+            actual = float(prepared_plan["compatibility"].get(
+                "source_audio_intro_seconds", 0.0))
+            target = float(prepared_plan["compatibility"].get(
+                "source_audio_intro_target_seconds", actual))
+            status += "; audio intro %.3fs (automatic target %.3fs)" % (
+                actual, target)
         if prepared_plan["compatibility"].get("external_context_hash"):
             status += "; scene 1 extends imported video"
             if isinstance(prepared_plan.get("prelude"), dict):
@@ -2117,8 +2212,20 @@ class MiniMaxH3ChainCurrent:
                     shot["audio_duration_seconds"],
                     pad_silence=bool(plan["compatibility"].get(
                         "source_audio_silent_padding")))
+        elif mode == "source_intro_generated":
+            if index == 1:
+                audio_slice = state.get("source_audio_intro")
+                if audio_slice is None:
+                    raise ValueError("H3 Chain Current Shot is missing its audio intro.")
         external_lead = int(shot.get("external_context_frames", 0))
-        if index == 1 and external_lead > 0:
+        if mode == "source_intro_generated":
+            intro = float(plan["compatibility"].get(
+                "source_audio_intro_seconds", 2.0))
+            audio_status = (
+                "source intro 0..%.3fs, then H3 generated audio" % intro
+                if index == 1 else "H3 generated audio continuation"
+            )
+        elif index == 1 and external_lead > 0:
             audio_status = "imported lead %.3fs + song 0..%.3fs" % (
                 external_lead / float(FPS),
                 int(shot["delivered_frames"]) / float(FPS))
@@ -2190,7 +2297,7 @@ class MiniMaxH3ChainContext:
         plan = state["plan"]
         cfg = plan["compatibility"]
         use_latent_audio = cfg["audio_mode"] in (
-            "generated_audio", "source_plus_timeline")
+            "generated_audio", "source_plus_timeline", "source_intro_generated")
         previous_latent = state.get("previous_latent") if use_latent_audio else None
         previous_audio = (state.get("previous_audio")
                           if use_latent_audio and external_first else None)
@@ -2278,9 +2385,9 @@ class MiniMaxH3ChainSegmentSave:
                 "Segment Save." % (index, actual_frames, expected_frames))
 
         mode = plan["compatibility"]["audio_mode"]
-        if mode == "generated_audio" and audio is None:
+        if mode in ("generated_audio", "source_intro_generated") and audio is None:
             raise ValueError(
-                "H3 chain generated_audio mode requires decoded audio on Segment "
+                "H3 chain generated-audio mode requires decoded audio on Segment "
                 "Save. Wire it through MiniMax H3 Contex Loop Trim first.")
         compact = _compact_latent(sampled_latent)
         context_length = int(plan["compatibility"]["context_length"])
@@ -2404,8 +2511,25 @@ def _review_video(plan: dict[str, Any], segment: dict[str, Any],
         }, False, "No audio is connected; this review is silent.")
 
     expected_frames = int(segment["delivered_frames"])
-    waveform, sample_rate = _validate_audio(
-        audio, "H3 Chain Review audio", expected_frames=expected_frames)
+    # Review playback is a convenience and must not reject an otherwise valid
+    # saved scene for a sub-frame decoder rounding difference.  Fit a private
+    # preview copy to the exact video clock; never mutate the delivered audio
+    # or checkpoint used by the chain itself.
+    waveform, sample_rate = _validate_audio(audio, "Simple H3 Review audio")
+    expected_samples = int(round(
+        expected_frames / float(FPS) * sample_rate))
+    supplied_samples = int(waveform.shape[-1])
+    if supplied_samples != expected_samples:
+        preview_audio = _pad_audio_to_samples(
+            {"waveform": waveform, "sample_rate": sample_rate},
+            expected_samples, "Simple H3 Review audio")
+        waveform = preview_audio["waveform"]
+        difference = supplied_samples - expected_samples
+        _LOG.info(
+            "Simple H3 Review fitted audio by %+d samples (%d -> %d at %d Hz) "
+            "for %d frames; saved media remains unchanged",
+            -difference, supplied_samples, expected_samples, sample_rate,
+            expected_frames)
     audio_value = {"waveform": waveform, "sample_rate": sample_rate}
     audio_hash = _audio_fingerprint(audio_value)
     video_hash = str(segment.get("segment_sha256") or _file_sha256(source))
@@ -2512,6 +2636,11 @@ class MiniMaxH3ChainReview:
                 "enabled": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Pause after every saved segment for approval."}),
+                "Continue": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Show every generated segment in the player but "
+                               "continue automatically without waiting for approval. "
+                               "The assembled final video replaces the last segment."}),
                 "play_notification_sound": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Play a browser chime when a segment becomes "
@@ -2571,7 +2700,7 @@ class MiniMaxH3ChainReview:
     def IS_CHANGED(cls, *args, **kwargs):
         return float("NaN")
 
-    async def review(self, state, segment, enabled, play_notification_sound,
+    async def review(self, state, segment, enabled, Continue, play_notification_sound,
                      auto_continue_timeout_minutes, unload_models_while_waiting,
                      assemble_partial_on_stop, partial_audio_source, audio=None,
                      source_audio=None,
@@ -2601,8 +2730,6 @@ class MiniMaxH3ChainReview:
         server_now = time.time()
         deadline = server_now + timeout_seconds if timeout_seconds > 0 else None
         token = uuid.uuid4().hex
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
         payload = {
             "token": token,
             "node_id": _review_display_id(unique_id, dynprompt),
@@ -2619,6 +2746,7 @@ class MiniMaxH3ChainReview:
                         if audio is not None else no_audio_warning),
             "preview_pending": audio is not None,
             "preview_revision": 0,
+            "auto_continue": bool(Continue),
             "play_notification_sound": bool(play_notification_sound),
             "unload_models_while_waiting": bool(unload_models_while_waiting),
             "assemble_partial_on_stop": bool(assemble_partial_on_stop),
@@ -2626,14 +2754,8 @@ class MiniMaxH3ChainReview:
             "deadline": deadline,
             "server_now": server_now,
         }
-        _PENDING_REVIEWS[token] = {
-            "future": future,
-            "loop": loop,
-            "public": payload,
-            "current_seed": int(shot["seed"]),
-        }
         PromptServer.instance.send_sync(
-            "minimax_h3_context_loop_review", dict(payload),
+            "simple_h3_chain_review", dict(payload),
             PromptServer.instance.client_id)
 
         if audio is not None:
@@ -2660,8 +2782,35 @@ class MiniMaxH3ChainReview:
                 "server_now": time.time(),
             })
             PromptServer.instance.send_sync(
-                "minimax_h3_context_loop_review", dict(payload),
+                "simple_h3_chain_review", dict(payload),
                 PromptServer.instance.client_id)
+
+        if Continue:
+            status = "Continue enabled; displayed clip %d/%d and continuing" % (
+                index, len(plan["shots"]))
+            if index == len(plan["shots"]):
+                _PENDING_FINAL_REVIEW_PREVIEWS[
+                    _final_review_preview_key(plan)
+                ] = {
+                    "token": token,
+                    "node_id": payload["node_id"],
+                    "client_id": PromptServer.instance.client_id,
+                }
+            PromptServer.instance.send_sync(
+                "simple_h3_chain_review_resolved",
+                {"token": token, "node_id": payload["node_id"],
+                 "action": "auto_continue", "status": status},
+                PromptServer.instance.client_id)
+            return {"ui": {"text": [status]}, "result": (segment, status)}
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        _PENDING_REVIEWS[token] = {
+            "future": future,
+            "loop": loop,
+            "public": payload,
+            "current_seed": int(shot["seed"]),
+        }
 
         if unload_models_while_waiting:
             try:
@@ -2683,9 +2832,17 @@ class MiniMaxH3ChainReview:
             status = (("review timed out; auto-approved clip %d/%d; continuing")
                       if timed_out else ("approved clip %d/%d; continuing")) % (
                           index, len(plan["shots"]))
+            if index == len(plan["shots"]):
+                _PENDING_FINAL_REVIEW_PREVIEWS[
+                    _final_review_preview_key(plan)
+                ] = {
+                    "token": token,
+                    "node_id": payload["node_id"],
+                    "client_id": PromptServer.instance.client_id,
+                }
             if timed_out:
                 PromptServer.instance.send_sync(
-                    "minimax_h3_context_loop_review_resolved",
+                    "simple_h3_chain_review_resolved",
                     {"token": token, "node_id": payload["node_id"],
                      "action": "timeout_approve", "status": status},
                     PromptServer.instance.client_id)
@@ -2715,7 +2872,7 @@ class MiniMaxH3ChainReview:
             if partial_item is not None:
                 resolved["partial_video"] = partial_item
             PromptServer.instance.send_sync(
-                "minimax_h3_context_loop_review_resolved", resolved,
+                "simple_h3_chain_review_resolved", resolved,
                 PromptServer.instance.client_id)
             return {
                 "ui": {"text": [status]},
@@ -3216,6 +3373,7 @@ def _run_ffmpeg(command: list[str], timeout_seconds: float | None = None) -> Non
     try:
         result = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -3737,7 +3895,7 @@ class MiniMaxH3ChainAssemble:
         return float("NaN")
 
     def assemble(self, manifest, audio_source, filename, audio_bitrate,
-                 source_audio=None):
+                 source_audio=None, publish_review=True):
         segments = _validate_manifest(manifest)
         prelude = _validate_prelude(manifest)
         selected = audio_source
@@ -3864,7 +4022,15 @@ class MiniMaxH3ChainAssemble:
             len(segments), " + existing-video prelude" if prelude else "",
             backend, final_path)
         _LOG.info("H3 Chain %s", status)
-        return {"ui": {"text": [status]}, "result": (final_path,)}
+        if publish_review:
+            _publish_final_review_preview(manifest, final_path, status)
+        return {
+            "ui": {
+                "text": [status],
+                "videos": [_video_output_item(final_path)],
+            },
+            "result": (final_path,),
+        }
 
 
 def _assemble_review_partial(
@@ -4040,11 +4206,11 @@ async def _list_saved_checkpoints(request):
 if (PromptServer is not None and web is not None and
         getattr(PromptServer, "instance", None) is not None):
     PromptServer.instance.routes.post(
-        "/minimax_h3_context_loop/review")(_submit_review_decision)
+        "/simple_h3_chain/review")(_submit_review_decision)
     PromptServer.instance.routes.get(
-        "/minimax_h3_context_loop/reviews")(_list_pending_reviews)
+        "/simple_h3_chain/reviews")(_list_pending_reviews)
     PromptServer.instance.routes.get(
-        "/minimax_h3_context_loop/checkpoints")(_list_saved_checkpoints)
+        "/simple_h3_chain/checkpoints")(_list_saved_checkpoints)
 
 
 CHAIN_NODE_CLASS_MAPPINGS = {

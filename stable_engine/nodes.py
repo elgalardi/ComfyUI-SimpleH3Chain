@@ -367,13 +367,17 @@ class MiniMaxH3MotionContext:
 
         available = int(context_frames.shape[0])
         n = min(int(context_length), available)
-        if n < 1:
+        audio_only = (
+            int(audio_context_length) > 0
+            and (context_latent is not None or context_audio is not None)
+        )
+        if n < 1 and not audio_only:
             raise ValueError("h3_motion_context: context_frames is empty")
         if n < context_length:
             _LOG.warning("h3_motion_context: only %d frames supplied, pinning %d",
                          available, n)
 
-        if encode_mode == "video":
+        if n > 0 and encode_mode == "video":
             # snap down to the VAE grid BEFORE slicing, so the frames encoded
             # are exactly the frames the latent steps will cover (see
             # VIDEO_RUN_GRID). Slicing the last n and letting the VAE keep the
@@ -386,16 +390,18 @@ class MiniMaxH3MotionContext:
                     "the last %d instead (usable runs: 1, 5, 22, 39)", n, run)
             n = run
 
-        if n >= frame_count:
+        if n > 0 and n >= frame_count:
             raise ValueError(
                 "h3_motion_context: asked to pin %d frames into a %d frame clip. "
                 "The pinned run must be a small fraction of the timeline."
                 % (n, frame_count))
 
-        # the LAST n frames of the incoming clip become the pinned run
-        tail = _resize(context_frames[available - n:], width, height, crop)
+        blocks, offsets, span = [], [], 0
+        if n > 0:
+            # the LAST n frames of the incoming clip become the pinned run
+            tail = _resize(context_frames[available - n:], width, height, crop)
 
-        if encode_mode == "video":
+        if n > 0 and encode_mode == "video":
             # one call; the VAE reads the batch axis as time and compresses
             enc = vae.encode(tail)
             if getattr(enc, "ndim", 0) != 5:
@@ -425,8 +431,7 @@ class MiniMaxH3MotionContext:
             else:
                 blocks = [enc[:, :, k:k + 1] for k in range(steps)]
             span = covered
-        else:
-            blocks, offsets = [], []
+        elif n > 0:
             for i in range(n):
                 blocks.append(vae.encode(tail[i:i + 1]))
                 offsets.append(i)
@@ -461,10 +466,14 @@ class MiniMaxH3MotionContext:
         timeline_end_frame = None
         a_frames = 0
         audio_src = "off"
-        if context_latent is not None or context_audio is not None:
+        audio_setting = int(audio_context_length)
+        if audio_setting < 0:
+            a_frames = 0
+        else:
+            a_frames = audio_setting or span
+        if a_frames > 0 and (context_latent is not None or context_audio is not None):
             # the audio window is independent of the video one: audio cond
             # rows cost rows but never cost delivered frames
-            a_frames = int(audio_context_length) or span
             if context_latent is not None:
                 if context_audio is not None:
                     _LOG.info("h3_motion_context: both context_latent and "
@@ -520,7 +529,11 @@ class MiniMaxH3MotionContext:
                     "audio_latent": audio_latent,
                 }
 
-        values = {"minimax_keyframes": keyframes}
+        existing_keyframes = list(
+            conditioning[0][1].get("minimax_keyframes", [])
+            if conditioning else []
+        )
+        values = {"minimax_keyframes": existing_keyframes + keyframes}
         if not native_guides:
             values["minimax_frame_count"] = frame_count
 
@@ -533,10 +546,12 @@ class MiniMaxH3MotionContext:
                 out, {"minimax_refs": [motion_context_audio_ref]}, append=True)
 
         trim = span if anchor_mode == "head" else 0
+        index_summary = ("%d..%d" % (indices[0], indices[-1])
+                         if indices else "none")
         _LOG.info("h3_motion_context: %s/%s, %d frames -> %d cond blocks at "
-                  "indices %d..%d, %d frame clip at %dx%d, trim %d, audio %s",
+                  "indices %s, %d frame clip at %dx%d, trim %d, audio %s",
                   encode_mode, anchor_mode, n, len(blocks),
-                  indices[0], indices[-1], frame_count, width, height, trim,
+                  index_summary, frame_count, width, height, trim,
                   ("%d frames -> %d latent steps (%.3fs) from %s, %s"
                    % (a_frames, ref_audio_t, ref_audio_t / AUDIO_HZ, audio_src,
                       "on the timeline ending at frame %.3f"
