@@ -7,10 +7,12 @@ unchanged. These nodes replace only the orchestration layer around it.
 
 ## Clean-cut continuity mode
 
-Simple H3 Chain no longer feeds the previous scene latent into the next scene.
-Every scene is a clean Ref2VA generation and therefore behaves like a cinematic
-cut instead of a continuous camera take when `Simple H3 Context` is set to
-`cut`. The same node can instead carry 1, 5, 11, 22, or 39 previous tail frames.
+By default, Simple H3 Chain does not feed the previous scene latent into the
+next scene. Every scene is a clean Ref2VA generation and therefore behaves like
+a cinematic cut instead of a continuous camera take when `Simple H3 Context`
+is set to `cut`. The opt-in `masked_av` mode described below is the sole direct
+latent-continuation path. The same node can otherwise carry 1, 5, 11, 22, or 39
+previous tail frames.
 Choose `video` for Context Loop's tested head-overlap contract: the selected
 frames are reproduced at the beginning of every later scene and Trim removes
 that exact overlap. The 11-frame option is a hybrid midpoint represented as
@@ -22,6 +24,56 @@ references; its `match_video` audio setting retains the established 22-frame
 generated-audio continuity. The Plan
 reads this Context widget automatically so timing, trimming, checkpoints and
 final assembly use the same contract.
+
+### Masked AV continuation (experimental)
+
+`masked_av` is a lossless continuation path for **Continuous Story**. It copies
+the final exact 39-frame video/audio run from the previous generated H3 latent
+into the new latent, protects that prefix from denoising, and generates only
+the future. This avoids both the decoded-frame guide reinterpretation and the
+audio decode/re-encode round trip. `audio_feather_ticks=8` gives the audio edge
+a short 0.2-second half-cosine release; use `0` only to compare a hard seam.
+
+Connect the Context node's new `latent` output to the sampler latent input.
+That output is a normal pass-through in `video`, `images`, and `cut_reference`,
+so one connection works for every mode. The original conditioning output stays
+connected as before. Scene 1 remains unchanged; imported scene-1 media uses the
+established VAE guide because no original sampler latent exists yet.
+
+Mode ownership is intentionally strict:
+
+- `Continuous Story`: may use `masked_av` for the strongest same-take AV seam.
+- `Cinematic Cuts`: `cut_reference` remains the automatic recommendation.
+  `masked_av` may be selected manually as an experimental A/B test; its protected
+  prefix can produce a strong seam or resist the requested camera change.
+- `Reference Edit`: use `images` or the normal reference path so the supplied
+  reference remains authoritative.
+- `Edit`: use `cut`; the locked source plate remains authoritative.
+
+For normal use, leave `context_type` on `director_auto`. The existing
+Story Director → Chain Plan connection already carries `director_mode`, so no
+additional cable is needed. It resolves to `video` for Continuous Story,
+`cut_reference` for Cinematic Cuts, `images` for Reference Edit, and a clean
+`cut` for Edit. Manual choices remain available for controlled A/B tests.
+
+The implementation uses current ComfyUI native MiniMax H3 nested AV masks and
+does not install or import any external Motion Context node pack. It requires
+matching resolution, batch size 1, a target longer than 39 frames, and a recent
+ComfyUI build with native MiniMax H3 AV-mask support.
+
+The direct latent-tail technique and exact shared AV-boundary analysis were
+informed by seitanism's GPL-3.0
+[ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef).
+Simple H3 keeps its own review, retry, checkpoint, per-scene reference routing,
+and final-assembly engine; that external node pack is neither installed nor
+required.
+
+Scene durations are delivered durations. For head-overlap modes, Simple H3 adds
+the selected context and any required H3 `17k+5` grid padding internally, then
+trims both after decoding. Selecting 5 seconds therefore delivers the same
+approximately 5.17-second H3 segment for every scene instead of shortening later
+scenes by the context window. Larger context windows generate more raw frames and
+take proportionally longer.
 
 `audio_context_frames` is independent from picture continuity. Use
 `match_video`, `off`, `1`, `5`, `11`, `22`, or `39`. For example, visual `5`

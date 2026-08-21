@@ -131,6 +131,17 @@ def _prompt_text(value: Any, label: str) -> str:
     return str(value or "").strip()
 
 
+def _h3_frame_length_at_least(requested: int) -> int:
+    """Return the first valid 17k+5 H3 length at or above a frame count."""
+    requested = max(5, int(requested))
+    length = requested + (5 - requested % 17) % 17
+    if length > MAX_H3_FRAMES:
+        raise ValueError(
+            "H3 requires at least %d frames after context compensation; the largest "
+            "valid 17k+5 length is %d frames." % (requested, MAX_H3_FRAMES))
+    return length
+
+
 def _h3_frame_length(seconds: float) -> int:
     """Round a duration up to H3's valid 17k+5 frame grid."""
     seconds = float(seconds)
@@ -139,13 +150,14 @@ def _h3_frame_length(seconds: float) -> int:
     # Subtract a tiny tolerance so an exactly frame-aligned decimal does not
     # jump a frame because of binary floating-point representation.
     requested = max(5, int(math.ceil(seconds * FPS - 1e-9)))
-    length = requested + (5 - requested % 17) % 17
-    if length > MAX_H3_FRAMES:
+    try:
+        return _h3_frame_length_at_least(requested)
+    except ValueError:
         raise ValueError(
             "H3 shot duration %.6fs rounds to %d frames; the largest valid "
             "17k+5 length is %d frames (%.6fs)." %
-            (seconds, length, MAX_H3_FRAMES, MAX_H3_FRAMES / float(FPS)))
-    return length
+            (seconds, requested + (5 - requested % 17) % 17,
+             MAX_H3_FRAMES, MAX_H3_FRAMES / float(FPS)))
 
 
 def _validate_h3_length(length: Any, label: str) -> int:
@@ -465,21 +477,35 @@ def _plan_with_external_context(
     anchor_mode = prepared["compatibility"]["anchor_mode"]
     for offset, shot in enumerate(prepared["shots"]):
         raw_frames = int(shot["raw_frames"])
+        duration_based = bool(shot.get("duration_based", False))
+        requested_delivered = int(
+            shot.get("requested_delivered_frames", raw_frames)
+        )
         if offset == 0:
             if anchor_mode == "head":
-                if raw_frames <= span:
+                if duration_based:
+                    raw_frames = _h3_frame_length_at_least(
+                        requested_delivered + span
+                    )
+                    shot["raw_frames"] = raw_frames
+                    delivered_frames = requested_delivered
+                elif raw_frames <= span:
                     raise ValueError(
                         "H3 scene 1 has %d raw frames, not enough for the "
                         "%d-frame imported-video overlap." % (raw_frames, span))
+                else:
+                    delivered_frames = raw_frames - span
                 generation_start = -span
-                delivered_frames = raw_frames - span
             else:
                 generation_start = 0
                 delivered_frames = raw_frames
             shot["external_context_frames"] = span
         elif anchor_mode == "head":
             generation_start = stitched_frames - configured
-            delivered_frames = raw_frames - configured
+            delivered_frames = (
+                requested_delivered if duration_based
+                else raw_frames - configured
+            )
         else:
             generation_start = stitched_frames
             delivered_frames = raw_frames
@@ -735,15 +761,18 @@ def _normalize_plan(
             part for part in (prompt_prefix, scene_prompt) if part)
 
         explicit_length = item.get("length", item.get("frames"))
+        duration_based = explicit_length is None
         if explicit_length is None:
             duration = float(item.get("duration_seconds", default_duration))
             if not math.isfinite(duration) or duration <= 0:
                 raise ValueError(
                     "Shot %d duration must be a finite positive number." % index)
-            raw_frames = _h3_frame_length(duration)
+            requested_delivered_frames = _h3_frame_length(duration)
+            raw_frames = requested_delivered_frames
         else:
             raw_frames = _validate_h3_length(explicit_length,
                                                    "Shot %d length" % index)
+            requested_delivered_frames = raw_frames
 
         if index == 1:
             generation_start_frame = 0
@@ -755,7 +784,17 @@ def _normalize_plan(
                     "continuation overlap." % (index, raw_frames, context_length))
             if anchor_mode == "head":
                 generation_start_frame = stitched_frames - context_length
-                delivered_frames = raw_frames - context_length
+                if duration_based:
+                    # A duration is a user-facing delivered duration. Generate
+                    # enough valid H3 frames to carry the repeated context, then
+                    # trim both the overlap and any 17k+5 grid padding.
+                    raw_frames = _h3_frame_length_at_least(
+                        requested_delivered_frames + context_length)
+                    delivered_frames = requested_delivered_frames
+                else:
+                    # Explicit frame lengths retain their historical meaning as
+                    # raw sampler lengths for backwards compatibility.
+                    delivered_frames = raw_frames - context_length
             else:
                 # `before` places context at negative coordinates, so no
                 # repeated head is delivered or trimmed from the new clip.
@@ -783,6 +822,8 @@ def _normalize_plan(
             "steps": steps,
             "raw_frames": raw_frames,
             "delivered_frames": delivered_frames,
+            "requested_delivered_frames": requested_delivered_frames,
+            "duration_based": duration_based,
             "generation_start_frame": generation_start_frame,
             "audio_start_seconds": generation_start_frame / float(FPS),
             "audio_duration_seconds": raw_frames / float(FPS),
@@ -818,6 +859,7 @@ def _normalize_plan(
     plan = {
         "version": PLAN_VERSION,
         "run_name": _safe_name(run_name, "h3_chain"),
+        "director_mode": str(raw.get("director_mode") or "Continuous Story"),
         "prompt_prefix": prompt_prefix,
         "shots": shots,
         "compatibility": compatibility,
@@ -825,6 +867,7 @@ def _normalize_plan(
         "total_delivered_frames": stitched_frames,
     }
     plan["plan_hash"] = _fingerprint({
+        "director_mode": plan["director_mode"],
         "compatibility": compatibility,
         "shots": [{k: v for k, v in shot.items()
                    if k not in ("prompt", "scene_prompt")}
