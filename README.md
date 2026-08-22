@@ -68,12 +68,13 @@ Simple H3 keeps its own review, retry, checkpoint, per-scene reference routing,
 and final-assembly engine; that external node pack is neither installed nor
 required.
 
-Scene durations are delivered durations. For head-overlap modes, Simple H3 adds
-the selected context and any required H3 `17k+5` grid padding internally, then
-trims both after decoding. Selecting 5 seconds therefore delivers the same
-approximately 5.17-second H3 segment for every scene instead of shortening later
-scenes by the context window. Larger context windows generate more raw frames and
-take proportionally longer.
+Scene durations are delivered durations for the normal head-overlap guide mode.
+`masked_av` deliberately keeps its original lossless contract instead: the
+selected duration is the raw H3 sampler length and every later scene removes
+only its exact 39-frame protected prefix. This makes later delivered scenes
+39 frames shorter, but avoids skipping newly generated bridge motion at a scene
+boundary. Larger context windows in normal guide mode generate more raw frames
+and take proportionally longer.
 
 `audio_context_frames` is independent from picture continuity. Use
 `match_video`, `off`, `1`, `5`, `11`, `22`, or `39`. For example, visual `5`

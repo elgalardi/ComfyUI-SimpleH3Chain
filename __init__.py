@@ -33,6 +33,16 @@ from .image_nodes import (
 from .masked_context import apply_masked_av_continuation
 
 
+class _SplitTrim(int):
+    """INT-compatible internal contract for head context plus H3 tail padding."""
+
+    def __new__(cls, head: int, tail: int):
+        obj = int.__new__(cls, max(0, int(head)) + max(0, int(tail)))
+        obj.head = max(0, int(head))
+        obj.tail = max(0, int(tail))
+        return obj
+
+
 def _safe_run_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "h3_chain"))
     value = value.strip("._-")
@@ -177,6 +187,21 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             )
         return unique[0] if unique else ("cut", "video", "match_video", 8)
 
+    @classmethod
+    def IS_CHANGED(cls, prompt=None, **kwargs):
+        """Invalidate Plan when the separately wired Context widget changes.
+
+        Context is read from the complete prompt so the recursive graph needs no
+        extra configuration cable. ComfyUI cannot otherwise see that hidden
+        dependency in the normal input links and may reuse a masked_av plan
+        after the user switches the Context node to video (or vice versa).
+        """
+        return hashlib.sha256(json.dumps(
+            cls._context_configuration(prompt),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
     @staticmethod
     def _audio_context_value(context_frames, context_type, setting):
         if setting == "off":
@@ -278,20 +303,34 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             default_steps=5,
             base_seed=0,
             segment_crf=18,
+            # masked_av keeps its original lossless contract: the selected
+            # duration is the raw H3 length and later scenes remove only the
+            # exact protected overlap. Compensating to a second 17k+5 length
+            # would create extra bridge frames and then discard them at head.
+            _preserve_delivered_duration=not masked_context,
+            # masked_av recovers every earlier protected overlap by extending
+            # only the final scene with its existing prompt.
+            _compensate_final_overlap_loss=masked_context,
         )
-        return result + (self._format_plan_preview(result[0]),)
+        return result + (self._format_plan_preview(result[0], context_type),)
 
     @staticmethod
-    def _format_plan_preview(plan):
+    def _format_plan_preview(plan, context_type="unknown"):
         compatibility = plan.get("compatibility", {})
         width = compatibility.get("width", "?")
         height = compatibility.get("height", "?")
+        compensated = any(
+            bool(shot.get("duration_compensated", False))
+            for shot in plan.get("shots", [])[1:]
+        )
         lines = [
             "SIMPLE H3 CHAIN PLAN",
             "=" * 58,
             str(plan.get("summary", "")),
             f"Resolution: {width} × {height}",
             f"Output: {plan.get('run_name', 'h3_chain')}",
+            f"Context mode: {context_type} · duration compensation: "
+            f"{'on' if compensated else 'off'}",
         ]
 
         prefix = str(plan.get("prompt_prefix") or "").strip()
@@ -473,6 +512,11 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             context_frames = "39"
             cut_reference = False
         if index == 1 and not external_first:
+            first_tail_trim = max(
+                0,
+                int(current_shot["raw_frames"])
+                - int(current_shot["delivered_frames"]),
+            )
             if state["plan"]["compatibility"]["audio_mode"] == "source_intro_generated":
                 intro = state.get("source_audio_intro")
                 if intro is None:
@@ -489,8 +533,15 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                     audio_vae=audio_vae,
                     audio=intro,
                 )
-                return (guided[0], 0, False, latent)
-            return (_chain._prepare_native_guide_conditioning(conditioning), 0, False, latent)
+                return (
+                    guided[0], _SplitTrim(0, first_tail_trim), False, latent
+                )
+            return (
+                _chain._prepare_native_guide_conditioning(conditioning),
+                _SplitTrim(0, first_tail_trim),
+                False,
+                latent,
+            )
 
         previous_frames = state.get("previous_frames")
         if previous_frames is None:
@@ -509,9 +560,11 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             masked_latent, trim = apply_masked_av_continuation(
                 latent, previous_latent, 39, audio_feather_ticks
             )
+            head_trim = int(trim)
+            tail_trim = max(0, int(planned_trim) - head_trim)
             return (
                 _chain._prepare_native_guide_conditioning(conditioning),
-                planned_trim,
+                _SplitTrim(head_trim, tail_trim),
                 True,
                 masked_latent,
             )
@@ -564,7 +617,17 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             audio_vae=audio_vae,
             context_audio=previous_audio,
         )
-        return (out, planned_trim, True, latent)
+        if context_type == "video":
+            # Duration compensation can add H3-grid padding beyond the actual
+            # repeated guide. Remove the guide from the head, but move that
+            # extra padding to the tail so the first newly generated motion is
+            # not accidentally discarded at every seam.
+            head_trim = max(0, int(trim))
+            tail_trim = max(0, int(planned_trim) - head_trim)
+            trim_contract = _SplitTrim(head_trim, tail_trim)
+        else:
+            trim_contract = planned_trim
+        return (out, trim_contract, True, latent)
 
 
 class SimpleH3CutReferenceSheet:
@@ -721,13 +784,70 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
         }
 
     def trim(self, images, trim_frames, audio=None):
-        return super().trim(
-            images=images,
-            trim_frames=trim_frames,
-            audio=audio,
-            fps=24.0,
-            match_tail=True,
-        )
+        head_trim = int(getattr(trim_frames, "head", int(trim_frames)))
+        tail_trim = int(getattr(trim_frames, "tail", 0))
+        if tail_trim:
+            total = int(images.shape[0])
+            if head_trim + tail_trim >= total:
+                raise ValueError(
+                    "Simple H3 split trim would remove the complete clip: "
+                    f"head={head_trim}, tail={tail_trim}, total={total}."
+                )
+            out_images = images[head_trim:total - tail_trim]
+            out_audio = audio
+            if audio is not None:
+                waveform = audio["waveform"]
+                sample_rate = int(audio["sample_rate"])
+                head_samples = int(round(head_trim / 24.0 * sample_rate))
+                wanted = int(round(
+                    int(out_images.shape[0]) / 24.0 * sample_rate
+                ))
+                available = waveform[..., head_samples:]
+                if int(available.shape[-1]) >= wanted:
+                    delivered_waveform = available[..., :wanted]
+                else:
+                    delivered_waveform = F.pad(
+                        available,
+                        (0, wanted - int(available.shape[-1])),
+                    )
+                out_audio = {
+                    "waveform": delivered_waveform,
+                    "sample_rate": sample_rate,
+                }
+            print(
+                "[Simple H3 Trim] split seam: removed "
+                f"{head_trim} context frames from head and {tail_trim} H3-grid "
+                "padding frames from tail."
+            )
+        else:
+            out_images, out_audio = super().trim(
+                images=images,
+                trim_frames=head_trim,
+                audio=audio,
+                fps=24.0,
+                match_tail=True,
+            )
+        # Segment Save decides whether the active plan is masked_av. Preserve
+        # the frame-locked raw decode as private AUDIO payload so masked-only
+        # final assembly can let the new extension own its protected overlap.
+        # Other context modes continue saving/assembling ``waveform`` exactly
+        # as before.
+        if audio is not None and out_audio is not None:
+            waveform = audio["waveform"]
+            sample_rate = int(audio["sample_rate"])
+            raw_samples = int(round(int(images.shape[0]) / 24.0 * sample_rate))
+            if int(waveform.shape[-1]) > raw_samples:
+                raw_waveform = waveform[..., :raw_samples]
+            elif int(waveform.shape[-1]) < raw_samples:
+                raw_waveform = F.pad(
+                    waveform, (0, raw_samples - int(waveform.shape[-1]))
+                )
+            else:
+                raw_waveform = waveform
+            out_audio = dict(out_audio)
+            out_audio["_simple_h3_raw_waveform"] = raw_waveform
+            out_audio["_simple_h3_raw_frames"] = int(images.shape[0])
+        return (out_images, out_audio)
 
 
 class SimpleH3ChainSegmentSave(_chain.MiniMaxH3ChainSegmentSave):

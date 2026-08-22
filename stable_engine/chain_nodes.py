@@ -478,12 +478,15 @@ def _plan_with_external_context(
     for offset, shot in enumerate(prepared["shots"]):
         raw_frames = int(shot["raw_frames"])
         duration_based = bool(shot.get("duration_based", False))
+        duration_compensated = bool(
+            shot.get("duration_compensated", duration_based)
+        )
         requested_delivered = int(
             shot.get("requested_delivered_frames", raw_frames)
         )
         if offset == 0:
             if anchor_mode == "head":
-                if duration_based:
+                if duration_compensated:
                     raw_frames = _h3_frame_length_at_least(
                         requested_delivered + span
                     )
@@ -503,7 +506,7 @@ def _plan_with_external_context(
         elif anchor_mode == "head":
             generation_start = stitched_frames - configured
             delivered_frames = (
-                requested_delivered if duration_based
+                requested_delivered if duration_compensated
                 else raw_frames - configured
             )
         else:
@@ -687,6 +690,8 @@ def _normalize_plan(
     base_seed: int,
     segment_crf: int,
     generation_fingerprint: str = "",
+    preserve_delivered_duration: bool = True,
+    compensate_final_overlap_loss: bool = False,
 ) -> dict[str, Any]:
     try:
         raw = json.loads(str(plan_json or ""))
@@ -784,7 +789,7 @@ def _normalize_plan(
                     "continuation overlap." % (index, raw_frames, context_length))
             if anchor_mode == "head":
                 generation_start_frame = stitched_frames - context_length
-                if duration_based:
+                if duration_based and preserve_delivered_duration:
                     # A duration is a user-facing delivered duration. Generate
                     # enough valid H3 frames to carry the repeated context, then
                     # trim both the overlap and any 17k+5 grid padding.
@@ -824,12 +829,39 @@ def _normalize_plan(
             "delivered_frames": delivered_frames,
             "requested_delivered_frames": requested_delivered_frames,
             "duration_based": duration_based,
+            "duration_compensated": bool(
+                duration_based and preserve_delivered_duration
+            ),
             "generation_start_frame": generation_start_frame,
             "audio_start_seconds": generation_start_frame / float(FPS),
             "audio_duration_seconds": raw_frames / float(FPS),
         }
         shots.append(shot)
         stitched_frames += delivered_frames
+
+    if bool(compensate_final_overlap_loss) and len(shots) > 1:
+        # Masked AV intentionally treats each requested H3 length as a raw
+        # sampler length, so every continuation contributes context_length
+        # fewer delivered frames. Recover the complete requested timeline only
+        # in the final continuation. Extending the first reference-anchored shot
+        # changes the first seam's timing and makes scene 1 -> 2 behave
+        # differently from every later masked overlap. Keeping all earlier
+        # shots untouched preserves one identical seam contract throughout.
+        recovered_frames = (len(shots) - 1) * context_length
+
+        last = shots[-1]
+        desired_delivered = int(last["delivered_frames"]) + recovered_frames
+        compensated_raw = _h3_frame_length_at_least(
+            desired_delivered + context_length
+        )
+        tail_padding = compensated_raw - desired_delivered - context_length
+        last["raw_frames"] = compensated_raw
+        last["delivered_frames"] = desired_delivered
+        last["audio_duration_seconds"] = compensated_raw / float(FPS)
+        last["duration_compensated"] = True
+        last["masked_time_recovery_frames"] = recovered_frames
+        last["tail_padding_frames"] = tail_padding
+        stitched_frames += recovered_frames
 
     for shot in shots[:-1]:
         if shot["delivered_frames"] < context_length:
@@ -2031,7 +2063,9 @@ class MiniMaxH3ChainPlan:
               context_length,
               encode_mode, anchor_mode, crop, audio_mode,
               audio_context_length, default_duration_seconds, default_steps,
-              base_seed, segment_crf, plan_json_input=None):
+              base_seed, segment_crf, plan_json_input=None,
+              _preserve_delivered_duration=True,
+              _compensate_final_overlap_loss=False):
         effective_plan_json = (
             plan_json_input
             if isinstance(plan_json_input, str) and plan_json_input.strip()
@@ -2041,7 +2075,9 @@ class MiniMaxH3ChainPlan:
             effective_plan_json, run_name, width, height, context_length, encode_mode,
             anchor_mode, crop, audio_mode, audio_context_length,
             default_duration_seconds, default_steps, base_seed, segment_crf,
-            generation_fingerprint)
+            generation_fingerprint,
+            preserve_delivered_duration=_preserve_delivered_duration,
+            compensate_final_overlap_loss=_compensate_final_overlap_loss)
         return (plan, plan["summary"], len(plan["shots"]),
                 plan["compatibility"]["width"],
                 plan["compatibility"]["height"])
@@ -2447,6 +2483,33 @@ class MiniMaxH3ChainSegmentSave:
                 audio, "H3 chain clip %d delivered audio" % index,
                 expected_frames=expected_frames)
             tensors["delivered_audio"] = _tensor_cpu_clone(waveform)
+            fingerprint = str(
+                plan.get("compatibility", {}).get("generation_fingerprint") or ""
+            )
+            if "type=masked_av" in fingerprint:
+                raw_waveform = audio.get("_simple_h3_raw_waveform")
+                raw_audio_frames = int(
+                    audio.get("_simple_h3_raw_frames", shot["raw_frames"])
+                )
+                if raw_waveform is None:
+                    raise ValueError(
+                        "Simple H3 masked_av requires audio from Simple H3 Trim "
+                        "so its protected overlap can be retained."
+                    )
+                if raw_audio_frames != int(shot["raw_frames"]):
+                    raise ValueError(
+                        "Simple H3 masked_av raw audio reports %d frames; expected %d."
+                        % (raw_audio_frames, int(shot["raw_frames"]))
+                    )
+                expected_raw_samples = int(round(
+                    raw_audio_frames / float(FPS) * sample_rate
+                ))
+                if int(raw_waveform.shape[-1]) != expected_raw_samples:
+                    raise ValueError(
+                        "Simple H3 masked_av raw audio has %d samples; expected %d."
+                        % (int(raw_waveform.shape[-1]), expected_raw_samples)
+                    )
+                tensors["masked_raw_audio"] = _tensor_cpu_clone(raw_waveform)
 
         paths = _artifact_paths(plan, index)
         os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
@@ -3301,8 +3364,113 @@ def _generated_audio(manifest: dict[str, Any]) -> dict[str, Any]:
                 (segment["index"], int(waveform.shape[-1]), expected,
                  int(segment["delivered_frames"])))
         waveforms.append(waveform)
-    return {"waveform": torch.cat(waveforms, dim=-1),
-            "sample_rate": int(sample_rate)}
+    fingerprint = str(
+        manifest.get("compatibility", {}).get("generation_fingerprint") or ""
+    )
+    if "type=masked_av" not in fingerprint:
+        return {"waveform": torch.cat(waveforms, dim=-1),
+                "sample_rate": int(sample_rate)}
+
+    def conform_masked_span(waveform, samples, label):
+        """Time-conform tiny H3 grid differences without adding silence."""
+        samples = int(samples)
+        current = int(waveform.shape[-1])
+        if current == samples:
+            return waveform.detach().cpu().contiguous()
+        fractional = abs(samples - current) / float(max(1, current))
+        if fractional > 0.005:
+            raise ValueError(
+                "%s differs from its frame-derived timeline by %.3f%%."
+                % (label, fractional * 100.0)
+            )
+        channels = int(waveform.shape[1])
+        fitted = torch.nn.functional.interpolate(
+            waveform.to(dtype=torch.float32).reshape(-1, 1, current),
+            size=samples, mode="linear", align_corners=False,
+        ).reshape(1, channels, samples)
+        _LOG.info(
+            "%s time-conformed %d -> %d samples for an exact frame boundary",
+            label, current, samples,
+        )
+        return fitted.detach().cpu().contiguous()
+
+    # Current upstream masked-AV ownership rule: each new extension contains
+    # the protected audio prefix generated with the half-cosine release. Keep
+    # that complete decoded audio and overwrite the matching tail of the
+    # preceding timeline instead of discarding the prefix at Trim.
+    total_frames = int(manifest["total_delivered_frames"])
+    total_samples = int(round(total_frames / float(FPS) * sample_rate))
+    first = manifest["segments"][0]
+    first_checkpoint = _absolute_output_path(first["checkpoint"])
+    first_tensors = _st_load(first_checkpoint)
+    first_wave = first_tensors.get("masked_raw_audio")
+    if first_wave is None:
+        first_wave = first_tensors["delivered_audio"]
+    channels = int(first_wave.shape[1])
+    audio_out = torch.empty(
+        (1, channels, total_samples), dtype=first_wave.dtype, device="cpu"
+    )
+    first_active_frames = int(first["delivered_frames"])
+    first_end = int(round(
+        first_active_frames / float(FPS) * sample_rate
+    ))
+    first_relative_samples = int(round(
+        first_active_frames / float(FPS) * sample_rate
+    ))
+    first_wave = first_wave[..., :first_relative_samples]
+    first_wave = conform_masked_span(
+        first_wave, first_end, "Simple H3 masked_av clip 1 audio"
+    )
+    audio_out[..., :first_end].copy_(first_wave)
+    cumulative_frames = int(first["delivered_frames"])
+
+    for segment in manifest["segments"][1:]:
+        checkpoint = _absolute_output_path(segment["checkpoint"])
+        tensors = _st_load(checkpoint)
+        raw_wave = tensors.get("masked_raw_audio")
+        if raw_wave is None:
+            raise ValueError(
+                "Checkpoint for masked_av clip %d predates overlap-owned audio. "
+                "Regenerate this clip with the current Simple H3 nodes."
+                % int(segment["index"])
+            )
+        overlap_frames = int(
+            manifest.get("compatibility", {}).get("context_length", 39)
+        )
+        tail_padding = max(
+            0,
+            int(segment["raw_frames"])
+            - int(segment["delivered_frames"])
+            - overlap_frames,
+        )
+        active_raw_frames = int(segment["raw_frames"]) - tail_padding
+        start_frame = cumulative_frames - overlap_frames
+        end_frame = start_frame + active_raw_frames
+        start_sample = int(round(start_frame / float(FPS) * sample_rate))
+        end_sample = int(round(end_frame / float(FPS) * sample_rate))
+        expected = end_sample - start_sample
+        relative_active_samples = int(round(
+            active_raw_frames / float(FPS) * sample_rate
+        ))
+        raw_wave = raw_wave[..., :relative_active_samples]
+        raw_wave = conform_masked_span(
+            raw_wave, expected,
+            "Simple H3 masked_av clip %d audio" % int(segment["index"]),
+        )
+        audio_out[..., start_sample:end_sample].copy_(raw_wave)
+        _LOG.info(
+            "Simple H3 masked_av audio: clip %d owns %d-frame protected overlap "
+            "from absolute frame %d; removed %d final H3-grid padding frames",
+            int(segment["index"]), overlap_frames, start_frame, tail_padding,
+        )
+        cumulative_frames = end_frame
+
+    if cumulative_frames != total_frames:
+        raise RuntimeError(
+            "Simple H3 masked_av audio timeline ended at frame %d; expected %d."
+            % (cumulative_frames, total_frames)
+        )
+    return {"waveform": audio_out, "sample_rate": int(sample_rate)}
 
 
 def _validate_prelude(manifest: dict[str, Any]) -> dict[str, Any] | None:
