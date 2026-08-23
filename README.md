@@ -1,5 +1,14 @@
 # ComfyUI Simple H3 Chain
 
+## Optional H3 Toolkit experiments
+
+`Simple H3 Chain Plan` exposes three opt-in tests. `av_aligned_experimental`
+snaps duration-based scenes to frame counts valid on both the 24 fps video clock
+and 40 Hz audio clock. `same_seed_experimental` gives every scene in Continuous
+Story one identical seed. `single_source_track_sliced` forces `source_track` so
+each scene receives the correct chronological slice of one connected soundtrack.
+All three default to the previous behavior.
+
 A focused MiniMax H3 clean-cut scene interface for the workflow used by SexyAI.
 
 The native H3 model, LoRA, attention, Ref2Video, sampler and decode chain stays
