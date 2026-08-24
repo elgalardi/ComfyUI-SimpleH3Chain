@@ -5,6 +5,14 @@ A focused MiniMax H3 clean-cut scene interface for the workflow used by SexyAI.
 The native H3 model, LoRA, attention, Ref2Video, sampler and decode chain stays
 unchanged. These nodes replace only the orchestration layer around it.
 
+## Optional model LoRA loader
+
+`Simple H3 Load LoRA — Optional` is a model-only loader intended for fixed API
+workflows. Its `lora_name` menu begins with `None`; selecting it, or setting
+`strength_model` to zero, returns the exact input `MODEL` unchanged. This lets a
+workflow keep up to four LoRA loaders permanently connected while the frontend
+activates only the requested slots. No CLIP or text-encoder patch is applied.
+
 ## Clean-cut continuity mode
 
 By default, Simple H3 Chain does not feed the previous scene latent into the

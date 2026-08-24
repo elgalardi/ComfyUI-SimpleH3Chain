@@ -22,6 +22,8 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import folder_paths
+import comfy.sd
+import comfy.utils
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
 
 from .stable_engine import chain_nodes as _chain
@@ -1605,7 +1607,91 @@ class SimpleH3ChainManifestLoad(_chain.MiniMaxH3ChainManifestLoad):
     CATEGORY = "MiniMax H3/Simple Chain"
 
 
+class SimpleH3OptionalLoraLoader:
+    """Model-only LoRA loader with an explicit, API-friendly None option."""
+
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (
+                    "MODEL",
+                    {"tooltip": "The diffusion model to pass through or patch."},
+                ),
+                "lora_name": (
+                    ["None", *folder_paths.get_filename_list("loras")],
+                    {
+                        "tooltip": (
+                            "Choose None to return the input MODEL unchanged. This "
+                            "keeps optional LoRA slots permanently connected."
+                        )
+                    },
+                ),
+                "strength_model": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": -100.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "LoRA strength for the diffusion model. Zero also acts "
+                            "as an exact passthrough."
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_TOOLTIPS = ("The unchanged or LoRA-patched diffusion model.",)
+    FUNCTION = "load_optional_lora"
+    CATEGORY = "MiniMax H3/Simple Chain/Loaders"
+    DESCRIPTION = (
+        "Model-only LoRA loader for fixed API workflows. None and strength 0 "
+        "return the exact input model without reading or applying a LoRA."
+    )
+    SEARCH_ALIASES = ["optional lora", "h3 lora", "lora none", "load lora"]
+
+    def load_optional_lora(self, model, lora_name, strength_model):
+        if str(lora_name).strip().lower() == "none" or float(strength_model) == 0.0:
+            return (model,)
+
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = None
+        lora_metadata = None
+        if self.loaded_lora is not None:
+            cached_path, lora, lora_metadata = self.loaded_lora
+            if cached_path != lora_path:
+                self.loaded_lora = None
+                lora = None
+                lora_metadata = None
+
+        if lora is None:
+            lora, lora_metadata = comfy.utils.load_torch_file(
+                lora_path,
+                safe_load=True,
+                return_metadata=True,
+            )
+            self.loaded_lora = (lora_path, lora, lora_metadata)
+
+        patched_model, _ = comfy.sd.load_lora_for_models(
+            model,
+            None,
+            lora,
+            float(strength_model),
+            0.0,
+            lora_metadata=lora_metadata,
+        )
+        return (patched_model,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "SimpleH3OptionalLoraLoader": SimpleH3OptionalLoraLoader,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
@@ -1632,6 +1718,7 @@ NODE_CLASS_MAPPINGS.update(_IMAGE_NODE_CLASS_MAPPINGS)
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SimpleH3OptionalLoraLoader": "Simple H3 Load LoRA — Optional",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
