@@ -144,27 +144,6 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                 "audio_mode": (list(_chain.AUDIO_MODES), {
                     "default": "generated_audio",
                 }),
-                "duration_grid": (["video_grid", "av_aligned_experimental"], {
-                    "default": "video_grid",
-                    "tooltip": (
-                        "AV aligned snaps requested scene durations to lengths valid on both "
-                        "H3's 24 fps video clock and 40 Hz audio clock: 39, 90, 141, 192, 243…"
-                    ),
-                }),
-                "continuous_seed": (["per_scene", "same_seed_experimental"], {
-                    "default": "per_scene",
-                    "tooltip": (
-                        "Same seed gives every scene one identical seed only in Continuous Story. "
-                        "Other Director modes retain their per-scene seeds."
-                    ),
-                }),
-                "soundtrack_strategy": (["selected_audio_mode", "single_source_track_sliced"], {
-                    "default": "selected_audio_mode",
-                    "tooltip": (
-                        "Single source track forces source_track mode so every scene receives its "
-                        "own chronological slice of one externally supplied soundtrack."
-                    ),
-                }),
                 "output_name": ("STRING", {
                     "default": "h3_chain",
                     "tooltip": "Folder and final-chain name. Use a new name for a new production.",
@@ -255,63 +234,9 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         return frames, "video"
 
     def build(
-        self, plan_json_input, width, height, audio_mode, duration_grid,
-        continuous_seed, soundtrack_strategy, output_name,
+        self, plan_json_input, width, height, audio_mode, output_name,
         prompt=None,
     ):
-        plan_json_for_build = str(plan_json_input or "")
-        raw_plan = None
-        try:
-            raw_plan = json.loads(plan_json_for_build)
-            if isinstance(raw_plan, list):
-                raw_plan = {"shots": raw_plan}
-        except json.JSONDecodeError:
-            # The stable engine returns the detailed JSON error below.
-            raw_plan = None
-        if isinstance(raw_plan, dict):
-            shots = raw_plan.get("shots")
-            if isinstance(shots, list) and shots:
-                if str(duration_grid) == "av_aligned_experimental":
-                    defaults = raw_plan.get("defaults")
-                    if not isinstance(defaults, dict):
-                        defaults = {}
-                        raw_plan["defaults"] = defaults
-                    fallback = float(defaults.get(
-                        "duration_seconds", raw_plan.get("duration_seconds", 15.0)
-                    ))
-                    for shot in shots:
-                        if not isinstance(shot, dict) or shot.get("length", shot.get("frames")) is not None:
-                            continue
-                        requested = float(shot.get("duration_seconds", fallback))
-                        target = max(39, round(requested * 24.0))
-                        candidates = list(range(39, max(447, target + 103), 51))
-                        frames = min(candidates, key=lambda value: (abs(value - target), value < target))
-                        shot["duration_seconds"] = frames / 24.0
-                    # Keep the displayed default coherent for shots that omit duration.
-                    default_target = max(39, round(fallback * 24.0))
-                    default_candidates = list(range(39, max(447, default_target + 103), 51))
-                    defaults["duration_seconds"] = min(
-                        default_candidates,
-                        key=lambda value: (abs(value - default_target), value < default_target),
-                    ) / 24.0
-                if (
-                    str(continuous_seed) == "same_seed_experimental"
-                    and str(raw_plan.get("director_mode") or "Continuous Story") == "Continuous Story"
-                ):
-                    first_seed = next((
-                        int(shot["seed"]) for shot in shots
-                        if isinstance(shot, dict) and shot.get("seed") is not None
-                    ), None)
-                    if first_seed is None:
-                        first_seed = int(hashlib.sha256(
-                            plan_json_for_build.encode("utf-8")
-                        ).hexdigest()[:16], 16)
-                    for shot in shots:
-                        if isinstance(shot, dict):
-                            shot["seed"] = first_seed
-                plan_json_for_build = json.dumps(raw_plan, ensure_ascii=False)
-        if str(soundtrack_strategy) == "single_source_track_sliced":
-            audio_mode = "source_track"
         context_frames, context_type, audio_context_frames, audio_feather_ticks = (
             self._context_configuration(prompt)
         )
@@ -354,11 +279,10 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             "simple-h3-chain-v6-context-contract:"
             f"{width}x{height}:audio={audio_mode}:"
             f"frames={context_frames}:type={context_type}:"
-            f"audio_context={audio_context_frames}:feather={audio_feather_ticks}:"
-            f"duration_grid={duration_grid}:seed={continuous_seed}:soundtrack={soundtrack_strategy}"
+            f"audio_context={audio_context_frames}:feather={audio_feather_ticks}"
         )
         result = super().build(
-            plan_json=plan_json_for_build,
+            plan_json=plan_json_input,
             run_name=run_name,
             generation_fingerprint=fingerprint,
             width=width,
@@ -388,16 +312,10 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             # only the final scene with its existing prompt.
             _compensate_final_overlap_loss=masked_context,
         )
-        return result + (self._format_plan_preview(
-            result[0], context_type, duration_grid, continuous_seed,
-            soundtrack_strategy,
-        ),)
+        return result + (self._format_plan_preview(result[0], context_type),)
 
     @staticmethod
-    def _format_plan_preview(
-        plan, context_type="unknown", duration_grid="video_grid",
-        continuous_seed="per_scene", soundtrack_strategy="selected_audio_mode",
-    ):
+    def _format_plan_preview(plan, context_type="unknown"):
         compatibility = plan.get("compatibility", {})
         width = compatibility.get("width", "?")
         height = compatibility.get("height", "?")
@@ -413,8 +331,6 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             f"Output: {plan.get('run_name', 'h3_chain')}",
             f"Context mode: {context_type} · duration compensation: "
             f"{'on' if compensated else 'off'}",
-            f"Toolkit experiments: duration={duration_grid} · seed={continuous_seed} · "
-            f"soundtrack={soundtrack_strategy}",
         ]
 
         prefix = str(plan.get("prompt_prefix") or "").strip()
@@ -428,18 +344,12 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             steps = int(shot.get("steps", 0))
             seed = int(shot.get("seed", 0))
             delivered = int(shot.get("delivered_frames", 0))
-            delivered_seconds = delivered / 24.0 if delivered > 0 else 0.0
-            compensated_shot = bool(shot.get("duration_compensated", False))
             prompt = str(shot.get("scene_prompt") or shot.get("prompt") or "").strip()
             lines.extend([
                 "",
                 f"SCENE {index:02d} — {shot_id}",
                 "-" * 58,
-                (
-                    f"Generation duration: {duration:.2f} s | Final delivery: "
-                    f"{delivered} frames ({delivered_seconds:.2f} s) | Steps: {steps}"
-                    + (" | Masked AV compensation" if compensated_shot else "")
-                ),
+                f"Duration: {duration:.2f} s | Delivered: {delivered} frames | Steps: {steps}",
                 f"Seed: {seed}",
                 "",
                 prompt,
