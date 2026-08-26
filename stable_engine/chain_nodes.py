@@ -4414,6 +4414,83 @@ async def _list_saved_checkpoints(request):
     })
 
 
+async def _list_studio_gallery(request):
+    """Return persistent Studio outputs independently of ComfyUI history."""
+    output_root = os.path.abspath(_output_root())
+    index_path = os.path.join(output_root, ".sexyai_gallery_index.json")
+    try:
+        with open(index_path, "r", encoding="utf-8") as index_file:
+            gallery_index = json.load(index_file)
+    except (OSError, ValueError, TypeError):
+        gallery_index = {}
+    items = []
+    video_extensions = {".mp4", ".webm", ".mov", ".mkv"}
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+
+    def add_file(file_path, kind):
+        relative = os.path.relpath(file_path, output_root)
+        subfolder = os.path.dirname(relative)
+        key = "%s:%s/%s" % (
+            kind, subfolder.replace("\\", "/"), os.path.basename(file_path))
+        indexed = gallery_index.get(key.lower(), {})
+        items.append({
+            "filename": os.path.basename(file_path),
+            "subfolder": subfolder,
+            "kind": kind,
+            "created_at": os.path.getmtime(file_path),
+            "prompt_id": indexed.get("promptId"),
+            "metadata": indexed.get("metadata"),
+        })
+
+    chains_root = os.path.join(output_root, "h3_chains")
+    if os.path.isdir(chains_root):
+        for current_root, _dirs, filenames in os.walk(chains_root):
+            if os.path.basename(current_root).lower() != "final":
+                continue
+            for filename in filenames:
+                file_path = os.path.join(current_root, filename)
+                if os.path.splitext(filename)[1].lower() in video_extensions:
+                    add_file(file_path, "video")
+
+    for folder_name, extensions, kind in (
+            ("SexyAI_Studio", image_extensions, "image"),
+            ("_sexyai_editor", video_extensions, "video")):
+        folder = os.path.join(output_root, folder_name)
+        if not os.path.isdir(folder):
+            continue
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if (os.path.isfile(file_path) and
+                    os.path.splitext(filename)[1].lower() in extensions):
+                add_file(file_path, kind)
+
+    items.sort(key=lambda item: (
+        float(item["created_at"]), item["filename"]), reverse=True)
+    return web.json_response({"results": items[:300]})
+
+
+async def _save_studio_gallery_index(request):
+    """Persist Studio media-to-plan metadata across ComfyUI restarts."""
+    try:
+        payload = await request.json()
+        entries = payload.get("entries")
+        if not isinstance(entries, dict) or len(entries) > 1000:
+            raise ValueError("Invalid gallery index")
+        safe_entries = {
+            str(key).lower(): value for key, value in entries.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+        index_path = os.path.join(
+            os.path.abspath(_output_root()), ".sexyai_gallery_index.json")
+        temporary = index_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as index_file:
+            json.dump(safe_entries, index_file, ensure_ascii=False, indent=2)
+        os.replace(temporary, index_path)
+        return web.json_response({"saved": len(safe_entries)})
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
 if (PromptServer is not None and web is not None and
         getattr(PromptServer, "instance", None) is not None):
     PromptServer.instance.routes.post(
@@ -4422,6 +4499,10 @@ if (PromptServer is not None and web is not None and
         "/simple_h3_chain/reviews")(_list_pending_reviews)
     PromptServer.instance.routes.get(
         "/simple_h3_chain/checkpoints")(_list_saved_checkpoints)
+    PromptServer.instance.routes.get(
+        "/simple_h3_chain/gallery")(_list_studio_gallery)
+    PromptServer.instance.routes.post(
+        "/simple_h3_chain/gallery/index")(_save_studio_gallery_index)
 
 
 CHAIN_NODE_CLASS_MAPPINGS = {
