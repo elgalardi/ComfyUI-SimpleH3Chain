@@ -42,10 +42,17 @@ function showWidget(item) {
 
 function refresh(node) {
     const contextType = widget(node, "context_type");
+    const contextFrames = widget(node, "context_frames");
+    const audioContextFrames = widget(node, "audio_context_frames");
     const feather = widget(node, "audio_feather_ticks");
     if (!contextType || !feather) return;
 
-    if (String(contextType.value) === "masked_av") showWidget(feather);
+    // Both supported modes use the exact 39-frame AV boundary. Keep the legacy
+    // widgets serialized for old workflows, but remove them from the UI so they
+    // cannot suggest that another continuation path is still active.
+    hideWidget(contextFrames);
+    hideWidget(audioContextFrames);
+    if (["masked_av", "masked_cut"].includes(String(contextType.value))) showWidget(feather);
     else hideWidget(feather);
 
     const computed = node.computeSize?.();

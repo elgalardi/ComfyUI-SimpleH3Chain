@@ -8,6 +8,7 @@ zero preserves an existing latent token and one generates a new token.
 from __future__ import annotations
 
 import logging
+import functools
 
 import torch
 
@@ -16,6 +17,61 @@ _LOG = logging.getLogger("simple_h3_chain.masked_context")
 FPS = 24.0
 AUDIO_HZ = 40.0
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+_PAYLOAD_COMPAT_MARKER = "_simple_h3_av_mask_payload_compat"
+
+
+def _ensure_av_mask_payload_compat():
+    """Expose packed video/audio masks to MiniMax H3 on transitional ComfyUI builds.
+
+    Recent ComfyUI versions contain the H3 mask engine and inpaint scaling, but
+    some builds do not yet unpack the nested AV denoise mask in ``extra_conds``.
+    Without these two conditions the workflow runs normally while silently
+    treating every continuation as a fresh shot.
+    """
+    import comfy.conds
+    import comfy.utils as comfy_utils
+    from comfy.model_base import MiniMaxH3
+
+    current = getattr(MiniMaxH3, "extra_conds", None)
+    if not callable(current):
+        raise RuntimeError("MiniMaxH3.extra_conds is unavailable in this ComfyUI build.")
+    if getattr(current, _PAYLOAD_COMPAT_MARKER, False):
+        return
+
+    # Native implementations already emit both conditions.  Detect this from
+    # the function code without executing it with synthetic model state.
+    code = getattr(current, "__code__", None)
+    names = set(getattr(code, "co_names", ()) or ())
+    constants = {value for value in (getattr(code, "co_consts", ()) or ()) if isinstance(value, str)}
+    if {"denoise_mask", "audio_denoise_mask"}.issubset(names | constants):
+        return
+
+    @functools.wraps(current, updated=())
+    def extra_conds_with_av_masks(self, **kwargs):
+        out = current(self, **kwargs)
+        if not isinstance(out, dict):
+            return out
+        if "denoise_mask" in out and "audio_denoise_mask" in out:
+            return out
+
+        packed_mask = kwargs.get("denoise_mask")
+        latent_shapes = kwargs.get("latent_shapes")
+        if packed_mask is None or latent_shapes is None or len(latent_shapes) < 2:
+            return out
+        masks = comfy_utils.unpack_latents(packed_mask, latent_shapes)
+        if len(masks) < 2:
+            return out
+        if "denoise_mask" not in out and torch.amin(masks[0]).item() < 1.0 - 1e-3:
+            out["denoise_mask"] = comfy.conds.CONDRegular(masks[0][:, :1].clone())
+        if "audio_denoise_mask" not in out and torch.amin(masks[1]).item() < 1.0 - 1e-3:
+            out["audio_denoise_mask"] = comfy.conds.CONDRegular(masks[1][:, :1].clone())
+        return out
+
+    setattr(extra_conds_with_av_masks, _PAYLOAD_COMPAT_MARKER, True)
+    MiniMaxH3.extra_conds = extra_conds_with_av_masks
+    _LOG.info(
+        "Simple H3 enabled MiniMax H3 AV-mask payload compatibility for masked continuation."
+    )
 
 
 def _pixel_frames(latent_steps: int) -> int:
@@ -105,6 +161,8 @@ def apply_masked_av_continuation(
             "This ComfyUI build cannot apply nested MiniMax H3 AV masks. "
             "Update ComfyUI or use the existing Video context mode."
         )
+
+    _ensure_av_mask_payload_compat()
 
     target_video, target_audio = _streams(target_latent)
     source_video, source_audio = _streams(source_latent)

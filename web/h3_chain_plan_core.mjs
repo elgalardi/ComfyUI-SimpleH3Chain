@@ -5,7 +5,7 @@ export const FPS = 24;
 export const MAX_SHOTS = 128;
 export const MAX_H3_FRAMES = 3592;
 export const MAX_SEED = 18446744073709551615n;
-export const CONTINUATION_MODES = Object.freeze(["guide", "masked_av"]);
+export const CONTINUATION_MODES = Object.freeze(["masked_av", "masked_cut"]);
 export const H3_CONTEXT_LENGTHS = Object.freeze([
     1, 5, 22, 39, 56, 73, 90, 107, 124,
     141, 158, 175, 192, 209, 226, 243,
@@ -554,7 +554,7 @@ export function calculatePlanTiming(plan, settings = {}) {
             continuationMode = sceneContinuationMode(
                 shot, planContinuationMode,
             );
-            if (sceneContext > 0 && continuationMode === "masked_av") {
+            if (sceneContext > 0 && ["masked_av", "masked_cut"].includes(continuationMode)) {
                 if (sceneContext < 5) {
                     rowErrors.push(
                         "Masked AV requires a context length of at least 5 frames.",
@@ -599,7 +599,7 @@ export function calculatePlanTiming(plan, settings = {}) {
             deliveredSeconds: deliveredFrames / FPS,
             generationStartFrame,
             contextLength: sceneContext,
-            audioContextLength: continuationMode === "masked_av"
+            audioContextLength: ["masked_av", "masked_cut"].includes(continuationMode)
                 ? sceneContext : sceneAudioContext,
             continuationMode,
             errors: rowErrors,

@@ -177,7 +177,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                     continue
                 found.append((
                     str(inputs.get("context_frames", "cut")),
-                    str(inputs.get("context_type", "video")),
+                    str(inputs.get("context_type", "masked_av")),
                     str(inputs.get("audio_context_frames", "match_video")),
                     int(inputs.get("audio_feather_ticks", 8)),
                 ))
@@ -187,7 +187,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                 "Simple H3 found Context nodes with different settings. Keep "
                 "one Context mode per chain."
             )
-        return unique[0] if unique else ("cut", "video", "match_video", 8)
+        return unique[0] if unique else ("39", "masked_av", "match_video", 8)
 
     @classmethod
     def IS_CHANGED(cls, prompt=None, **kwargs):
@@ -217,23 +217,14 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
     @staticmethod
     def _director_context(context_frames, context_type, director_mode):
         """Resolve the context contract carried inside Story Director's plan."""
-        if context_type != "director_auto":
-            return str(context_frames), str(context_type)
         mode = str(director_mode or "Continuous Story")
-        if mode == "Cinematic Cuts":
-            return "cut", "cut_reference"
-        if mode == "Reference Edit":
-            # A small still-state carry helps multi-scene reference edits while
-            # allowing the connected source/reference to remain authoritative.
-            frames = "5" if str(context_frames) == "cut" else str(context_frames)
-            return frames, "images"
-        if mode == "Edit":
-            return "cut", "video"
-        # Continuous Story keeps the established guide-based path as the safe
-        # automatic default. masked_av remains an explicit A/B-test option
-        # because it also requires routing this node's latent output.
-        frames = "22" if str(context_frames) == "cut" else str(context_frames)
-        return frames, "video"
+        requested = str(context_type)
+        if requested in ("masked_av", "masked_cut"):
+            return "39", requested
+        # Migrate workflows saved with the retired context modes. Cinematic
+        # Cuts keeps a masked state bridge but begins a fresh camera setup;
+        # every other director mode defaults to same-take masked continuity.
+        return "39", ("masked_cut" if mode == "Cinematic Cuts" else "masked_av")
 
     def build(
         self, plan_json_input, width, height, audio_mode, output_name,
@@ -253,13 +244,13 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         context_frames, context_type = self._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type == "masked_av":
+        if context_type in ("masked_av", "masked_cut"):
             context_frames = "39"
         audio_context = self._audio_context_value(
             context_frames, context_type, audio_context_frames
         )
         cut_reference = context_type == "cut_reference"
-        masked_context = context_type == "masked_av"
+        masked_context = context_type in ("masked_av", "masked_cut")
         if cut_reference:
             # Visual delivery is a clean cut, but the generated soundtrack keeps
             # a tested 22-frame tail. Five is the smallest native storage window
@@ -418,7 +409,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                     "tooltip": "Current scene's empty H3 latent.",
                 }),
                 "context_frames": (["cut", "1", "5", "11", "22", "39"], {
-                    "default": "cut",
+                    "default": "39",
                     "tooltip": (
                         "cut disables previous-scene visual context; audio may still "
                         "continue through audio_context_frames. Other values carry "
@@ -438,29 +429,20 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                         "generated-audio carry. Source-track audio is already continuous."
                     ),
                 }),
-                "context_type": ([
-                    "director_auto", "video", "images", "cut_reference", "masked_av"
-                ], {
-                    "default": "director_auto",
+                "context_type": (["masked_av", "masked_cut"], {
+                    "default": "masked_av",
                     "tooltip": (
-                        "director_auto reads Director Mode from the connected plan: "
-                        "Continuous Story -> video, Cinematic Cuts -> cut_reference, "
-                        "Reference Edit -> images, Edit -> cut. video encodes the "
-                        "selected tail as a temporal window. "
-                        "images pins every selected frame independently. "
-                        "cut_reference ignores the numeric window and uses only "
-                        "the final 3 consecutive frames as visual state references, "
-                        "without carrying camera motion. Audio continuity is selected "
-                        "independently with audio_context_frames. masked_av is an "
-                        "experimental direct latent-to-latent continuation for "
-                        "any Director mode; it protects an exact 39-frame AV prefix "
-                        "without decode/re-encode loss, but may resist a hard cut."
+                        "masked_av preserves an exact 39-frame latent AV prefix for "
+                        "the strongest same-shot continuation. masked_cut uses the "
+                        "same lossless state transfer while the Director requests a "
+                        "new camera setup. Both remove the protected prefix before "
+                        "assembly and compensate the final duration automatically."
                     ),
                 }),
                 "audio_feather_ticks": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
                     "tooltip": (
-                        "Only for masked_av. Smoothly releases the final audio "
+                        "Used by both masked modes. Smoothly releases the final audio "
                         "context edge. 8 ticks equals 0.2 seconds at H3's 40 Hz "
                         "audio latent rate; 0 uses a hard boundary."
                     ),
@@ -476,8 +458,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
     RETURN_TYPES = ("CONDITIONING", "INT", "BOOLEAN", "LATENT")
     RETURN_NAMES = ("conditioning", "trim_frames", "is_continuation", "latent")
     OUTPUT_TOOLTIPS = _chain.MiniMaxH3ChainContext.OUTPUT_TOOLTIPS + (
-        "Latent ready for sampling. Required when context_type is masked_av; "
-        "safe to use for every other mode as a pass-through.",
+        "Masked latent ready for sampling. Connect this output to the sampler.",
     )
 
     def apply(
@@ -490,7 +471,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
         context_frames, context_type = SimpleH3ChainPlan._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type == "masked_av":
+        if context_type in ("masked_av", "masked_cut"):
             context_frames = "39"
         cut_reference = context_type == "cut_reference"
         requested_audio = SimpleH3ChainPlan._audio_context_value(
@@ -506,7 +487,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             - int(current_shot["delivered_frames"]),
         )
         external_first = index == 1 and bool(state.get("external_context"))
-        if context_type == "masked_av" and external_first:
+        if context_type in ("masked_av", "masked_cut") and external_first:
             # Imported media has no original sampler latent to copy. Seed the
             # first generated scene through the established VAE-guide path;
             # subsequent generated scenes switch to lossless masked AV.
@@ -550,12 +531,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             raise ValueError("Simple H3 context has no previous scene frames.")
 
         cfg = plan["compatibility"]
-        if context_type == "masked_av":
-            if director_mode != "Continuous Story":
-                print(
-                    "[Simple H3 Context] Experimental masked_av override active for "
-                    f"{director_mode}; the protected 39-frame prefix may resist a hard cut."
-                )
+        if context_type in ("masked_av", "masked_cut"):
             previous_latent = state.get("previous_latent")
             if previous_latent is None:
                 raise ValueError("Masked AV Continuation has no previous sampled H3 latent.")
@@ -1722,7 +1698,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
-    "SimpleH3ChainContext": "Simple H3 Context — Video / Images / Cut Reference / Masked AV",
+    "SimpleH3ChainContext": "Simple H3 Context — Masked AV / Masked Cut",
     "SimpleH3CutReferenceSheet": "Simple H3 Cut Reference Sheet",
     "SimpleH3SelectContinuityFrames": "Simple H3 Select Continuity Frames",
     "SimpleH3LoopTrim": "Simple H3 Trim + Lock Audio",
