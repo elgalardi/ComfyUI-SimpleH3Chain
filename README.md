@@ -13,6 +13,33 @@ workflows. Its `lora_name` menu begins with `None`; selecting it, or setting
 workflow keep up to four LoRA loaders permanently connected while the frontend
 activates only the requested slots. No CLIP or text-encoder patch is applied.
 
+## Optional learned latent upscale
+
+`Simple H3 Latent Upscale — Resolution` keeps the requested delivery size but,
+when enabled, calculates an aligned first pass at approximately half width and
+half height (25% of the final pixels). `Simple H3 Latent Upscale + Refine —
+Optional` then applies LBH-123-AI's learned MiniMax H3 3D latent upscaler and a
+short partial-denoise pass at the requested resolution. When disabled, both
+nodes are exact pass-throughs and the original workflow is preserved.
+
+For multi-scene chains, decode the `delivery_latent` but route
+`context_latent` to the checkpoint and Loop End. This keeps Masked AV on one
+stable low-resolution grid between scenes. The generated audio latent is never
+refined: it is copied unchanged into the final-resolution delivery latent.
+
+The two refinement contracts are intentionally separate nodes. `Simple H3
+Latent Upscale + Refine — Optional` retains its bounded automatic 2–6-step
+denoise pass. `Simple H3 Latent Upscale + Refine — Advanced` has no denoise
+widget and instead exposes the full global schedule, `start_at_step`,
+`end_at_step`, `add_noise`, and `return_with_leftover_noise` with native
+KSampler Advanced semantics. For an 8-step plan, starting at step 3 evaluates
+five high-resolution steps. Leave `end_at_step` at 10000 to finish the schedule
+and remove leftover noise.
+
+Required optional dependency:
+[`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler),
+with a compatible model in `ComfyUI/models/latent_upscale_models`.
+
 ## Clean-cut continuity mode
 
 By default, Simple H3 Chain does not feed the previous scene latent into the

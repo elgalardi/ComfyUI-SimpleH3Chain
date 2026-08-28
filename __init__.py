@@ -1666,8 +1666,369 @@ class SimpleH3OptionalLoraLoader:
         return (patched_model,)
 
 
+class SimpleH3LatentUpscaleResolution:
+    """Resolve a low-resolution H3 first pass from the requested final size."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 1280, "min": 64, "max": 4096, "step": 8}),
+                "height": ("INT", {"default": 720, "min": 64, "max": 4096, "step": 8}),
+                "latent_upscale": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Off keeps the requested resolution unchanged. On generates the "
+                        "chain near half width and half height, then restores the requested "
+                        "size with the learned H3 latent upscaler and a short refinement pass."
+                    ),
+                }),
+                "first_pass_scale": ("FLOAT", {
+                    "default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Spatial scale used for the first H3 pass. 0.5 means approximately "
+                        "half width and half height, or one quarter of the final pixels."
+                    ),
+                }),
+                "align": ("INT", {
+                    "default": 32, "min": 16, "max": 256, "step": 16,
+                    "tooltip": "Align the generated width and height to the H3 pixel grid.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "BOOLEAN", "STRING")
+    RETURN_NAMES = (
+        "first_pass_width", "first_pass_height", "final_width", "final_height",
+        "latent_upscale", "status",
+    )
+    FUNCTION = "resolve"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Calculates an aligned low-resolution first pass while preserving the user's "
+        "requested final dimensions. Connect the first-pass dimensions to the native H3 "
+        "conditioning node and the final dimensions to Simple H3 Latent Upscale + Refine."
+    )
+
+    @staticmethod
+    def _aligned(value, scale, align):
+        target = float(value) * float(scale)
+        return max(int(align) * 2, int(round(target / int(align))) * int(align))
+
+    def resolve(self, width, height, latent_upscale, first_pass_scale, align):
+        final_width = int(width)
+        final_height = int(height)
+        enabled = bool(latent_upscale) and float(first_pass_scale) < 0.999
+        if not enabled:
+            return (
+                final_width, final_height, final_width, final_height, False,
+                f"Latent upscale off: native {final_width}x{final_height}",
+            )
+
+        first_width = min(
+            final_width,
+            self._aligned(final_width, first_pass_scale, align),
+        )
+        first_height = min(
+            final_height,
+            self._aligned(final_height, first_pass_scale, align),
+        )
+        if first_width == final_width and first_height == final_height:
+            enabled = False
+        first_pixels = first_width * first_height
+        final_pixels = max(1, final_width * final_height)
+        return (
+            first_width, first_height, final_width, final_height, enabled,
+            (
+                f"Latent upscale {'on' if enabled else 'off'}: "
+                f"{first_width}x{first_height} -> {final_width}x{final_height} "
+                f"({first_pixels / final_pixels:.1%} first-pass pixels)"
+            ),
+        )
+
+
+class SimpleH3LatentUpscaleRefine:
+    """Optionally upscale an H3 video latent and refine only its video stream."""
+
+    UPSCALE_FOLDER = "latent_upscale_models"
+
+    @classmethod
+    def _models(cls):
+        if cls.UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
+            folder_paths.add_model_folder_path(
+                cls.UPSCALE_FOLDER,
+                os.path.join(folder_paths.models_dir, cls.UPSCALE_FOLDER),
+            )
+        models = folder_paths.get_filename_list(cls.UPSCALE_FOLDER)
+        return models or ["(place an H3 upscaler in models/latent_upscale_models)"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "sampled_latent": ("LATENT", {
+                    "tooltip": "Completed low-resolution H3 AV latent from the primary sampler.",
+                }),
+                "latent_upscale": ("BOOLEAN", {"default": False}),
+                "upscaler_model": (cls._models(),),
+                "final_width": ("INT", {"default": 1280, "min": 64, "max": 4096, "step": 8}),
+                "final_height": ("INT", {"default": 720, "min": 64, "max": 4096, "step": 8}),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "generation_steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
+                "refine_denoise": ("FLOAT", {
+                    "default": 0.35, "min": 0.05, "max": 0.75, "step": 0.01,
+                    "tooltip": (
+                        "Short high-resolution detail recovery. Lower values preserve the "
+                        "low-resolution motion more strictly; higher values may add detail but "
+                        "can alter faces or motion."
+                    ),
+                }),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "lcm"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "beta57"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "STRING")
+    RETURN_NAMES = ("delivery_latent", "context_latent", "status")
+    OUTPUT_TOOLTIPS = (
+        "Final-resolution AV latent for video/audio decode.",
+        "Original low-resolution sampled latent for Masked AV continuation and checkpoints.",
+        "Upscale/refinement summary.",
+    )
+    FUNCTION = "upscale_refine"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Optional learned 3D latent upscale followed by a short H3 refinement. The audio "
+        "latent is preserved exactly. Use delivery_latent for decode and context_latent "
+        "for checkpoints plus Simple H3 Loop End so every continuation remains on the "
+        "low-resolution grid."
+    )
+
+    def upscale_refine(
+        self, model, positive, negative, sampled_latent, latent_upscale,
+        upscaler_model, final_width, final_height, seed, generation_steps,
+        refine_denoise, sampler_name, scheduler,
+    ):
+        if not bool(latent_upscale):
+            return (sampled_latent, sampled_latent, "Latent upscale off; native latent delivered.")
+
+        try:
+            from custom_nodes.Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d import (
+                MinimaxH3LatentUpscaler3D,
+                UpscaleMode,
+            )
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
+            import nodes as comfy_nodes
+        except Exception as error:
+            raise RuntimeError(
+                "Simple H3 latent upscale requires LBH-123-AI/"
+                "Comfyui_Minimax_h3_latent_Upscaler to be installed."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(sampled_latent)
+        video_latent, audio_latent = separated[0], separated[1]
+        source_shape = tuple(video_latent["samples"].shape)
+        mode = {
+            "mode": UpscaleMode.TARGET_DIMENSIONS,
+            "width": int(final_width),
+            "height": int(final_height),
+        }
+        upscaled_video = MinimaxH3LatentUpscaler3D.execute(
+            latent=video_latent,
+            model_name=str(upscaler_model),
+            mode=mode,
+            align=32,
+            enable_chunking=True,
+            device="cuda",
+            precision="fp16",
+        )[0]
+
+        combined = LTXVConcatAVLatent.execute(upscaled_video, audio_latent)[0]
+
+        # The low-resolution pass already established composition and motion. A
+        # bounded partial denoise restores high-frequency detail without paying
+        # for a second full generation at the requested resolution.
+        refine_steps = max(2, min(6, int(math.ceil(int(generation_steps) * 0.5))))
+        refined = comfy_nodes.common_ksampler(
+            model,
+            int(seed),
+            refine_steps,
+            1.0,
+            str(sampler_name),
+            str(scheduler),
+            positive,
+            negative,
+            combined,
+            denoise=float(refine_denoise),
+        )[0]
+
+        # H3 jointly predicts audio and video. Keep the original generated audio
+        # bit-for-bit at latent level so refinement cannot degrade voices/music.
+        refined_video = LTXVSeparateAVLatent.execute(refined)[0]
+        delivery = LTXVConcatAVLatent.execute(refined_video, audio_latent)[0]
+        delivery = dict(delivery)
+        delivery["_simple_h3_context_latent"] = sampled_latent
+        target_shape = tuple(refined_video["samples"].shape)
+        return (
+            delivery,
+            sampled_latent,
+            (
+                f"H3 latent upscale {source_shape[-1] * 16}x{source_shape[-2] * 16} "
+                f"-> {target_shape[-1] * 16}x{target_shape[-2] * 16}; "
+                f"{refine_steps} refinement steps at denoise {float(refine_denoise):.2f}; "
+                "original audio latent preserved."
+            ),
+        )
+
+
+class SimpleH3LatentUpscaleRefineAdvanced(SimpleH3LatentUpscaleRefine):
+    """Learned H3 latent upscale with native KSampler Advanced controls."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "sampled_latent": ("LATENT", {
+                    "tooltip": "Completed low-resolution H3 AV latent from the primary sampler.",
+                }),
+                "latent_upscale": ("BOOLEAN", {"default": False}),
+                "upscaler_model": (cls._models(),),
+                "final_width": ("INT", {"default": 1280, "min": 64, "max": 4096, "step": 8}),
+                "final_height": ("INT", {"default": 720, "min": 64, "max": 4096, "step": 8}),
+                "add_noise": (["enable", "disable"], {"default": "enable"}),
+                "noise_seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 100.0,
+                    "step": 0.1, "round": 0.01,
+                }),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "res_multistep"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
+                "start_at_step": ("INT", {
+                    "default": 3, "min": 0, "max": 10000,
+                    "tooltip": "Skip earlier schedule steps exactly like KSampler Advanced.",
+                }),
+                "end_at_step": ("INT", {
+                    "default": 10000, "min": 0, "max": 10000,
+                    "tooltip": "10000 means the end of the selected step schedule.",
+                }),
+                "return_with_leftover_noise": (["disable", "enable"], {
+                    "default": "disable",
+                }),
+            },
+        }
+
+    FUNCTION = "upscale_refine_advanced"
+    DESCRIPTION = (
+        "Separate Advanced variant of the optional H3 learned latent upscaler. "
+        "It has no denoise control: refinement is defined exclusively by the full "
+        "step schedule, start_at_step, end_at_step, noise and leftover-noise settings."
+    )
+
+    def upscale_refine_advanced(
+        self, model, positive, negative, sampled_latent, latent_upscale,
+        upscaler_model, final_width, final_height, add_noise, noise_seed,
+        steps, cfg, sampler_name, scheduler, start_at_step, end_at_step,
+        return_with_leftover_noise,
+    ):
+        if not bool(latent_upscale):
+            return (sampled_latent, sampled_latent, "Latent upscale off; native latent delivered.")
+
+        try:
+            from custom_nodes.Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d import (
+                MinimaxH3LatentUpscaler3D,
+                UpscaleMode,
+            )
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
+            import nodes as comfy_nodes
+        except Exception as error:
+            raise RuntimeError(
+                "Simple H3 latent upscale requires LBH-123-AI/"
+                "Comfyui_Minimax_h3_latent_Upscaler to be installed."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(sampled_latent)
+        video_latent, audio_latent = separated[0], separated[1]
+        source_shape = tuple(video_latent["samples"].shape)
+        mode = {
+            "mode": UpscaleMode.TARGET_DIMENSIONS,
+            "width": int(final_width),
+            "height": int(final_height),
+        }
+        upscaled_video = MinimaxH3LatentUpscaler3D.execute(
+            latent=video_latent,
+            model_name=str(upscaler_model),
+            mode=mode,
+            align=32,
+            enable_chunking=True,
+            device="cuda",
+            precision="fp16",
+        )[0]
+        combined = LTXVConcatAVLatent.execute(upscaled_video, audio_latent)[0]
+        schedule_steps = max(1, int(steps))
+        schedule_start = max(0, min(int(start_at_step), schedule_steps - 1))
+        requested_end = int(end_at_step)
+        schedule_end = (
+            schedule_steps
+            if requested_end >= 10000
+            else max(schedule_start + 1, min(requested_end, schedule_steps))
+        )
+        refined = comfy_nodes.common_ksampler(
+            model,
+            int(noise_seed),
+            schedule_steps,
+            float(cfg),
+            str(sampler_name),
+            str(scheduler),
+            positive,
+            negative,
+            combined,
+            denoise=1.0,
+            disable_noise=str(add_noise) == "disable",
+            start_step=schedule_start,
+            last_step=schedule_end,
+            force_full_denoise=str(return_with_leftover_noise) == "disable",
+        )[0]
+
+        refined_video = LTXVSeparateAVLatent.execute(refined)[0]
+        delivery = LTXVConcatAVLatent.execute(refined_video, audio_latent)[0]
+        delivery = dict(delivery)
+        delivery["_simple_h3_context_latent"] = sampled_latent
+        target_shape = tuple(refined_video["samples"].shape)
+        return (
+            delivery,
+            sampled_latent,
+            (
+                f"H3 latent upscale {source_shape[-1] * 16}x{source_shape[-2] * 16} "
+                f"-> {target_shape[-1] * 16}x{target_shape[-2] * 16}; "
+                f"advanced steps {schedule_start}->{schedule_end} of {schedule_steps} "
+                f"({schedule_end - schedule_start} evaluated); "
+                "original audio latent preserved."
+            ),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "SimpleH3OptionalLoraLoader": SimpleH3OptionalLoraLoader,
+    "SimpleH3LatentUpscaleResolution": SimpleH3LatentUpscaleResolution,
+    "SimpleH3LatentUpscaleRefine": SimpleH3LatentUpscaleRefine,
+    "SimpleH3LatentUpscaleRefineAdvanced": SimpleH3LatentUpscaleRefineAdvanced,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
@@ -1695,6 +2056,9 @@ NODE_CLASS_MAPPINGS.update(_IMAGE_NODE_CLASS_MAPPINGS)
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3OptionalLoraLoader": "Simple H3 Load LoRA — Optional",
+    "SimpleH3LatentUpscaleResolution": "Simple H3 Latent Upscale — Resolution",
+    "SimpleH3LatentUpscaleRefine": "Simple H3 Latent Upscale + Refine — Optional",
+    "SimpleH3LatentUpscaleRefineAdvanced": "Simple H3 Latent Upscale + Refine — Advanced",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
