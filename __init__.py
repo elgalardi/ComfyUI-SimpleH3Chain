@@ -85,7 +85,7 @@ def _versioned_final_name(manifest, requested: str) -> str:
     base = _chain._safe_name(expanded, "final")
     run_name = _chain._safe_name(manifest.get("run_name"), "h3_chain")
     final_dir = os.path.join(
-        _chain._output_root(), "h3_chains", run_name, "final"
+        _chain._output_root(), run_name, "final"
     )
     candidate = base
     version = 2
@@ -123,13 +123,15 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
     """Small front end for the stable frame-exact chain planner."""
 
     RETURN_TYPES = (
-        _chain.PLAN_TYPE, "STRING", "INT", "INT", "INT", "STRING"
+        _chain.PLAN_TYPE, "STRING", "INT", "INT", "INT", "STRING", "BOOLEAN"
     )
     RETURN_NAMES = (
-        "plan", "summary", "clip_count", "width", "height", "plan_preview"
+        "plan", "summary", "clip_count", "width", "height", "plan_preview",
+        "base_preview"
     )
     OUTPUT_TOOLTIPS = _chain.MiniMaxH3ChainPlan.OUTPUT_TOOLTIPS + (
         "Readable production plan with every scene, duration, steps, seed, and prompt.",
+        "Master low-resolution base-preview switch for the recursive chain.",
     )
 
     @classmethod
@@ -152,6 +154,14 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                 "output_name": ("STRING", {
                     "default": "h3_chain",
                     "tooltip": "Folder and final-chain name. Use a new name for a new production.",
+                }),
+                "base_preview": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Decode and display complete low-resolution base scenes. "
+                        "Disable to decode only the 39-frame Masked AV context "
+                        "tail and skip every base MP4."
+                    ),
                 }),
             },
             "hidden": {
@@ -231,6 +241,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
 
     def build(
         self, plan_json_input, width, height, audio_mode, output_name,
+        base_preview,
         prompt=None,
     ):
         context_frames, context_type, audio_context_frames, audio_feather_ticks = (
@@ -275,7 +286,8 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             "simple-h3-chain-v6-context-contract:"
             f"{width}x{height}:audio={audio_mode}:"
             f"frames={context_frames}:type={context_type}:"
-            f"audio_context={audio_context_frames}:feather={audio_feather_ticks}"
+            f"audio_context={audio_context_frames}:feather={audio_feather_ticks}:"
+            f"base_preview={int(bool(base_preview))}"
         )
         result = super().build(
             plan_json=plan_json_input,
@@ -308,7 +320,11 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             # only the final scene with its existing prompt.
             _compensate_final_overlap_loss=masked_context,
         )
-        return result + (self._format_plan_preview(result[0], context_type),)
+        result[0]["base_preview"] = bool(base_preview)
+        result[0]["compatibility"]["base_preview"] = bool(base_preview)
+        return result + (
+            self._format_plan_preview(result[0], context_type), bool(base_preview)
+        )
 
     @staticmethod
     def _format_plan_preview(plan, context_type="unknown"):
@@ -742,6 +758,67 @@ class SimpleH3SelectContinuityFrames:
         )
 
 
+class SimpleH3BaseContextDecode:
+    """Decode a full base scene or only the Masked AV visual context tail."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "state": (_chain.STATE_TYPE,),
+                "samples": ("LATENT",),
+                "vae": ("VAE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "status")
+    FUNCTION = "decode"
+    CATEGORY = "MiniMax H3/Simple Chain"
+    DESCRIPTION = (
+        "Decode the complete base scene when Plan base_preview is enabled; "
+        "otherwise decode only the final Masked AV context tail."
+    )
+
+    def decode(self, state, samples, vae):
+        plan = state["plan"]
+        full_preview = bool(plan.get("base_preview", True))
+        latent = samples["samples"]
+        if getattr(latent, "is_nested", False):
+            latent = latent.unbind()[0]
+        if not torch.is_tensor(latent) or latent.ndim != 5:
+            raise ValueError(
+                "Simple H3 Base Context Decode requires a 5D H3 video latent."
+            )
+        if full_preview:
+            selected = latent
+            mode = "complete base scene"
+        else:
+            from .masked_context import _pixel_frames
+            context_frames = int(plan["compatibility"]["context_length"])
+            context_tokens = next(
+                (value for value in range(1, int(latent.shape[2]) + 1)
+                 if _pixel_frames(value) == context_frames),
+                None,
+            )
+            if context_tokens is None:
+                raise ValueError(
+                    f"The {context_frames}-frame context has no exact H3 latent boundary."
+                )
+            if int(latent.shape[2]) < context_tokens:
+                raise ValueError("The current H3 latent is shorter than its context tail.")
+            selected = latent[:, :, -context_tokens:].contiguous()
+            mode = f"context tail only ({context_frames} frames)"
+        images = vae.decode(selected)
+        if images.ndim == 5:
+            images = images.reshape(
+                -1, images.shape[-3], images.shape[-2], images.shape[-1]
+            )
+        status = f"Decoded {mode}: {int(images.shape[0])} frames"
+        _chain._LOG.info("Simple H3 %s", status)
+        return (images, status)
+
+
 class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
     CATEGORY = "MiniMax H3/Simple Chain"
 
@@ -761,13 +838,49 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
                 "audio": ("AUDIO", {
                     "tooltip": "Decoded scene audio. It is trimmed and frame-locked automatically at 24 fps.",
                 }),
+                "state": (_chain.STATE_TYPE, {
+                    "tooltip": (
+                        "Connect Current Scene state to enable Plan-controlled "
+                        "tail-only base decoding. Older workflows may leave this empty."
+                    ),
+                }),
             },
         }
 
-    def trim(self, images, trim_frames, audio=None):
+    def trim(self, images, trim_frames, audio=None, state=None):
         head_trim = int(getattr(trim_frames, "head", int(trim_frames)))
         tail_trim = int(getattr(trim_frames, "tail", 0))
-        if tail_trim:
+        plan = state["plan"] if isinstance(state, dict) else None
+        base_preview = bool(plan.get("base_preview", True)) if plan else True
+        shot = plan["shots"][int(state["index"]) - 1] if plan else None
+        if not base_preview:
+            context_length = int(plan["compatibility"]["context_length"])
+            if int(images.shape[0]) != context_length:
+                raise ValueError(
+                    "Latent-only base decode returned %d frames; expected the "
+                    "%d-frame context tail." % (int(images.shape[0]), context_length)
+                )
+            out_images = images
+            out_audio = audio
+            if audio is not None:
+                waveform = audio["waveform"]
+                sample_rate = int(audio["sample_rate"])
+                head_samples = int(round(head_trim / 24.0 * sample_rate))
+                wanted = int(round(
+                    int(shot["delivered_frames"]) / 24.0 * sample_rate
+                ))
+                available = waveform[..., head_samples:]
+                if int(available.shape[-1]) >= wanted:
+                    delivered_waveform = available[..., :wanted]
+                else:
+                    delivered_waveform = F.pad(
+                        available, (0, wanted - int(available.shape[-1]))
+                    )
+                out_audio = {
+                    "waveform": delivered_waveform,
+                    "sample_rate": sample_rate,
+                }
+        elif tail_trim:
             total = int(images.shape[0])
             if head_trim + tail_trim >= total:
                 raise ValueError(
@@ -816,7 +929,10 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
         if audio is not None and out_audio is not None:
             waveform = audio["waveform"]
             sample_rate = int(audio["sample_rate"])
-            raw_samples = int(round(int(images.shape[0]) / 24.0 * sample_rate))
+            raw_frames = (
+                int(shot["raw_frames"]) if shot is not None else int(images.shape[0])
+            )
+            raw_samples = int(round(raw_frames / 24.0 * sample_rate))
             if int(waveform.shape[-1]) > raw_samples:
                 raw_waveform = waveform[..., :raw_samples]
             elif int(waveform.shape[-1]) < raw_samples:
@@ -827,7 +943,7 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
                 raw_waveform = waveform
             out_audio = dict(out_audio)
             out_audio["_simple_h3_raw_waveform"] = raw_waveform
-            out_audio["_simple_h3_raw_frames"] = int(images.shape[0])
+            out_audio["_simple_h3_raw_frames"] = raw_frames
         return (out_images, out_audio)
 
 
@@ -877,19 +993,29 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
                 "source_audio": ("AUDIO", {
                     "tooltip": "Connect the full source song only when the plan uses source audio.",
                 }),
+                "preserve_recovery": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Keep checkpoints available for a downstream refined pass even "
+                        "when the base final itself is only a temporary preview."
+                    ),
+                }),
             },
         }
 
     @staticmethod
-    def _temporary_preview_path():
+    def _temporary_preview_path(manifest):
         output_root = os.path.abspath(folder_paths.get_output_directory())
+        run_name = _safe_run_name(manifest.get("run_name", "h3_chain"))
         preview_dir = os.path.abspath(os.path.join(
-            output_root, "_simple_h3_temporary_preview"
+            output_root, run_name, "previews", "base"
         ))
         if os.path.commonpath([output_root, preview_dir]) != output_root:
             raise ValueError("Simple H3 temporary preview escaped the output folder.")
         os.makedirs(preview_dir, exist_ok=True)
         for name in os.listdir(preview_dir):
+            if not name.startswith("temporary_base_preview."):
+                continue
             path = os.path.join(preview_dir, name)
             try:
                 if os.path.isfile(path) or os.path.islink(path):
@@ -905,23 +1031,47 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
                     path, exc,
                 )
         return os.path.join(
-            preview_dir, "SimpleH3Preview.%s.mp4" % uuid.uuid4().hex
+            preview_dir, "temporary_base_preview.%s.mp4" % uuid.uuid4().hex
         )
 
     @staticmethod
-    def _remove_completed_run(manifest):
+    def _remove_completed_run(manifest, keep_path=None, keep_paths=None):
         output_root = os.path.abspath(folder_paths.get_output_directory())
-        chains_root = os.path.abspath(os.path.join(output_root, "h3_chains"))
         run_name = _safe_run_name(manifest.get("run_name", "h3_chain"))
-        run_dir = os.path.abspath(os.path.join(chains_root, run_name))
-        if (os.path.commonpath([chains_root, run_dir]) != chains_root
-                or run_dir == chains_root):
+        run_dir = os.path.abspath(os.path.join(output_root, run_name))
+        retained = {
+            os.path.abspath(value) for value in (
+                list(keep_paths or []) + ([keep_path] if keep_path else [])
+            ) if value
+        }
+        if (os.path.commonpath([output_root, run_dir]) != output_root
+                or run_dir == output_root
+                or any(os.path.commonpath([run_dir, value]) != run_dir
+                       for value in retained)):
             raise ValueError("Simple H3 refused to clean an unsafe run path.")
+
+        def purge(path):
+            resolved = os.path.abspath(path)
+            if resolved in retained:
+                return
+            if os.path.isdir(resolved) and not os.path.islink(resolved):
+                for name in os.listdir(resolved):
+                    purge(os.path.join(resolved, name))
+                try:
+                    os.rmdir(resolved)
+                except OSError:
+                    # The directory either contains the retained preview or a
+                    # browser still has one file open. Both are safe to keep.
+                    pass
+            else:
+                _chain._safe_unlink(resolved)
+
         def remove(attempt=0):
             if not os.path.isdir(run_dir):
                 return
             try:
-                shutil.rmtree(run_dir)
+                for name in os.listdir(run_dir):
+                    purge(os.path.join(run_dir, name))
             except OSError as exc:
                 if attempt >= 3:
                     _chain._LOG.warning(
@@ -934,7 +1084,8 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
                 timer.start()
         remove()
 
-    def assemble(self, manifest, filename, save_output, source_audio=None):
+    def assemble(self, manifest, filename, save_output, source_audio=None,
+                 preserve_recovery=False):
         final_name = _versioned_final_name(manifest, filename)
         result = super().assemble(
             manifest=manifest,
@@ -948,12 +1099,17 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
             return result
 
         final_path = os.path.abspath(result["result"][0])
-        preview_path = self._temporary_preview_path()
+        preview_path = self._temporary_preview_path(manifest)
         os.replace(final_path, preview_path)
-        self._remove_completed_run(manifest)
+        if not bool(preserve_recovery):
+            self._remove_completed_run(manifest, keep_path=preview_path)
         status = (
-            "temporary final preview ready; removed this run's segments, "
-            "checkpoints, prompts, reviews, manifest and permanent output"
+            "temporary final preview ready; " + (
+                "kept recovery artifacts for downstream refinement"
+                if bool(preserve_recovery) else
+                "removed this run's segments, checkpoints, prompts, reviews, "
+                "manifest and permanent output"
+            )
         )
         _chain._LOG.info("Simple H3 %s -> %s", status, preview_path)
         _chain._publish_final_review_preview(manifest, preview_path, status)
@@ -970,6 +1126,50 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
         "mode. Save Output can retain the production or clean its intermediate "
         "files after publishing one temporary final preview."
     )
+
+
+class SimpleH3BasePreviewAssemble(SimpleH3ChainAssemble):
+    """Base comparison assembler that never destroys refinement checkpoints."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "manifest": (_chain.MANIFEST_TYPE,),
+                "filename": ("STRING", {"forceInput": True}),
+                "save_output": ("BOOLEAN", {"forceInput": True}),
+                "assemble_base_video": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Create and publish the complete low-resolution base comparison "
+                        "video. Disable to pass directly to final latent refinement."
+                    ),
+                }),
+            },
+            "optional": {"source_audio": ("AUDIO",)},
+        }
+
+    DESCRIPTION = (
+        "Assemble the automatic base preview while always preserving scene "
+        "checkpoints for the downstream final latent upscale/refinement path."
+    )
+
+    def assemble(self, manifest, filename, save_output, assemble_base_video=True,
+                 source_audio=None):
+        if not bool(assemble_base_video):
+            status = (
+                "Base final assembly disabled; preserved latent checkpoints for "
+                "downstream refinement"
+            )
+            _chain._LOG.info("Simple H3 %s", status)
+            return {"ui": {"text": [status]}, "result": ("",)}
+        return super().assemble(
+            manifest=manifest,
+            filename=filename,
+            save_output=save_output,
+            source_audio=source_audio,
+            preserve_recovery=True,
+        )
 
 
 STORYBOARD_LAYOUT_TYPE = "H3_STORYBOARD_LAYOUT"
@@ -1634,6 +1834,8 @@ class SimpleH3OptionalLoraLoader:
         "Model-only LoRA loader for fixed API workflows. None and strength 0 "
         "return the exact input model without reading or applying a LoRA."
     )
+
+
     SEARCH_ALIASES = ["optional lora", "h3 lora", "lora none", "load lora"]
 
     def load_optional_lora(self, model, lora_name, strength_model):
@@ -1669,6 +1871,62 @@ class SimpleH3OptionalLoraLoader:
         return (patched_model,)
 
 
+class SimpleH3BasePreview(_chain.MiniMaxH3ChainReview):
+    """Automatic scene monitor; the downstream assembler publishes its final here."""
+
+    CATEGORY = "MiniMax H3/Simple Chain"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "state": (_chain.STATE_TYPE,),
+                "segment": (_chain.SEGMENT_TYPE,),
+                "filename": ("STRING", {"default": "%date:yyyy-MM-dd%"}),
+                "save_output": ("BOOLEAN", {"default": True}),
+                "show_scene_previews": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Show every generated base scene in this player. Disable to "
+                        "pass the scene through without publishing browser previews."
+                    ),
+                }),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+                "source_audio": ("AUDIO",),
+            },
+            "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = (_chain.SEGMENT_TYPE, "STRING", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("segment", "status", "filename", "save_output")
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Automatically displays every generated base scene, continues without a "
+        "review decision, and receives the complete assembled video in the same player."
+    )
+
+    async def preview(self, state, segment, filename, save_output,
+                      show_scene_previews=True, audio=None,
+                      source_audio=None, dynprompt=None, unique_id=None):
+        if not bool(show_scene_previews):
+            status = "Base scene preview disabled; continuing directly"
+            return {
+                "ui": {"text": [status]},
+                "result": (segment, status, str(filename), bool(save_output)),
+            }
+        response = await super().review(
+            state=state, segment=segment, enabled=True, Continue=True,
+            play_notification_sound=False, auto_continue_timeout_minutes=0.0,
+            unload_models_while_waiting=False, assemble_partial_on_stop=False,
+            partial_audio_source="checkpointed", audio=audio,
+            source_audio=source_audio, dynprompt=dynprompt, unique_id=unique_id,
+        )
+        result = tuple(response["result"])
+        response["result"] = result + (str(filename), bool(save_output))
+        return response
 class SimpleH3LatentUpscaleResolution:
     """Resolve a low-resolution H3 first pass from the requested final size."""
 
@@ -2156,23 +2414,1020 @@ class SimpleH3LatentUpscaleRefineMasked(SimpleH3LatentUpscaleRefineAdvanced):
         )
 
 
+def _h3_video_tokens_for_total_frames(total_frames):
+    """Return the exact H3 video-token count for one delivered timeline."""
+    from .masked_context import _pixel_frames
+
+    total_frames = int(total_frames)
+    if total_frames < 1:
+        raise ValueError("The assembled H3 timeline must contain at least one frame.")
+    # H3 frame lengths are sparse but the loop planner guarantees an exact
+    # representable cumulative timeline. Keep the search explicit so a corrupt
+    # or foreign manifest fails instead of silently shifting a seam.
+    approximate = max(1, int(math.ceil(total_frames / 3.4)))
+    for tokens in range(max(1, approximate - 16), approximate + 32):
+        value = _pixel_frames(tokens)
+        if value == total_frames:
+            return tokens
+        if value > total_frames:
+            break
+    raise ValueError(
+        f"The delivered H3 timeline length {total_frames} does not map to an "
+        "exact latent-token boundary."
+    )
+
+
+def _h3_video_tokens_at_least_frames(total_frames):
+    """Return the first H3 token boundary at or beyond a delivered timeline."""
+    from .masked_context import _pixel_frames
+
+    requested = max(1, int(total_frames))
+    tokens = max(1, int(math.floor(requested / 3.4)))
+    while _pixel_frames(tokens) < requested:
+        tokens += 1
+    return tokens, _pixel_frames(tokens)
+
+
+class SimpleH3FinalWindowedLatentUpscale(SimpleH3LatentUpscaleRefine):
+    """Rebuild the completed base timeline and upscale it with temporal windows."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "manifest": (_chain.MANIFEST_TYPE, {
+                    "tooltip": (
+                        "Completed manifest from Simple H3 Loop Until Final Scene. "
+                        "All base latents are read from its verified checkpoints."
+                    ),
+                }),
+                "latent_upscale": ("BOOLEAN", {"default": True}),
+                "upscaler_model": (cls._models(),),
+                "final_width": ("INT", {
+                    "default": 1280, "min": 64, "max": 4096, "step": 8,
+                }),
+                "final_height": ("INT", {
+                    "default": 720, "min": 64, "max": 4096, "step": 8,
+                }),
+                "temporal_windowing": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Process the complete latent timeline in overlapping temporal "
+                        "windows inside the learned 3D upscaler to limit peak VRAM."
+                    ),
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "STRING")
+    RETURN_NAMES = ("final_latent", "delivered_frames", "status")
+    OUTPUT_TOOLTIPS = (
+        "One exact assembled AV latent, optionally upscaled after all scenes finish.",
+        "Exact user-facing frame count. Trim the decoded result to this value.",
+        "Timeline reconstruction, seam trimming, windowing and resolution summary.",
+    )
+    FUNCTION = "assemble_and_upscale"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Experimental post-chain path. It reconstructs the exact low-resolution "
+        "Masked AV timeline from scene checkpoints, removes repeated 39-frame heads "
+        "and final grid padding, then applies one learned 3D upscale over overlapping "
+        "temporal windows. It performs no second diffusion pass and preserves the "
+        "original generated audio latent."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("NaN")
+
+    def assemble_and_upscale(
+        self, manifest, latent_upscale, upscaler_model, final_width,
+        final_height, temporal_windowing,
+    ):
+        if (not isinstance(manifest, dict) or
+                manifest.get("format") != "h3_chain_manifest_v3"):
+            raise ValueError(
+                "Final Windowed Latent Upscale requires a completed Simple H3 manifest."
+            )
+        segments = list(manifest.get("segments") or [])
+        if not segments:
+            raise ValueError("The completed Simple H3 manifest contains no scenes.")
+
+        try:
+            from safetensors.torch import load_file as load_safetensors
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent
+        except Exception as error:
+            raise RuntimeError(
+                "Final Windowed Latent Upscale requires safetensors and ComfyUI's "
+                "native joint AV latent nodes."
+            ) from error
+
+        compatibility = manifest.get("compatibility") or {}
+        context_frames = int(compatibility.get("context_length", 0))
+        fingerprint = str(compatibility.get("generation_fingerprint") or "")
+        masked = any(value in fingerprint for value in ("type=masked_av", "type=masked_cut"))
+        if masked and context_frames != 39:
+            raise ValueError(
+                "Final Windowed Latent Upscale currently requires the exact 39-frame "
+                "Masked AV/Cut boundary."
+            )
+
+        video_parts = []
+        audio_parts = []
+        delivered_total = 0
+        latent_total_frames = 0
+        total_audio_ticks = 0
+        video_shape = None
+        audio_shape = None
+        removed_video_tokens = 0
+        removed_audio_ticks = 0
+
+        for position, segment in enumerate(segments):
+            index = int(segment.get("index", position + 1))
+            _chain._verify_segment_artifacts(segment, index)
+            checkpoint = _chain._absolute_output_path(segment["checkpoint"])
+            tensors = load_safetensors(checkpoint, device="cpu")
+            if "video" not in tensors or "audio" not in tensors:
+                raise ValueError(
+                    f"Scene {index} checkpoint has no base MiniMax H3 AV latent."
+                )
+            video = tensors["video"].detach().cpu().contiguous()
+            audio = tensors["audio"].detach().cpu().contiguous()
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            if audio.ndim == 3:
+                audio = audio.unsqueeze(0)
+            if video.ndim != 5 or audio.ndim != 4:
+                raise ValueError(
+                    f"Scene {index} has invalid latent shapes: "
+                    f"video={tuple(video.shape)}, audio={tuple(audio.shape)}."
+                )
+            current_video_shape = tuple(video.shape[1:2] + video.shape[3:])
+            current_audio_shape = tuple(audio.shape[1:3])
+            if video_shape is None:
+                video_shape = current_video_shape
+                audio_shape = current_audio_shape
+            elif current_video_shape != video_shape or current_audio_shape != audio_shape:
+                raise ValueError(
+                    "All base scenes must use identical latent resolution and audio geometry."
+                )
+
+            delivered = int(segment.get("delivered_frames", 0))
+            if delivered <= 0:
+                raise ValueError(f"Scene {index} has no valid delivered frame count.")
+            desired_cumulative = delivered_total + delivered
+            is_last = position == len(segments) - 1
+            if is_last:
+                next_total_tokens, next_latent_frames = (
+                    _h3_video_tokens_at_least_frames(desired_cumulative)
+                )
+            else:
+                next_total_tokens = _h3_video_tokens_for_total_frames(
+                    desired_cumulative
+                )
+                next_latent_frames = desired_cumulative
+            previous_total_tokens = sum(int(value.shape[2]) for value in video_parts)
+            delivered_tokens = next_total_tokens - previous_total_tokens
+            head_tokens = 0
+            head_audio = 0
+            if position and masked:
+                head_tokens = _h3_video_tokens_for_total_frames(context_frames)
+                head_audio = int(round(context_frames / 24.0 * 40.0))
+            if head_tokens + delivered_tokens > int(video.shape[2]):
+                raise ValueError(
+                    f"Scene {index} cannot provide {delivered_tokens} delivered video "
+                    f"tokens after its {head_tokens}-token context head."
+                )
+
+            next_audio_ticks = int(round(next_latent_frames / 24.0 * 40.0))
+            delivered_audio_ticks = next_audio_ticks - total_audio_ticks
+            if head_audio + delivered_audio_ticks > int(audio.shape[-1]):
+                raise ValueError(
+                    f"Scene {index} cannot provide {delivered_audio_ticks} delivered "
+                    f"audio ticks after its {head_audio}-tick context head."
+                )
+            video_parts.append(
+                video[:, :, head_tokens:head_tokens + delivered_tokens].clone()
+            )
+            audio_parts.append(
+                audio[..., head_audio:head_audio + delivered_audio_ticks].clone()
+            )
+            removed_video_tokens += int(video.shape[2]) - delivered_tokens
+            removed_audio_ticks += int(audio.shape[-1]) - delivered_audio_ticks
+            delivered_total = desired_cumulative
+            latent_total_frames = next_latent_frames
+            total_audio_ticks = next_audio_ticks
+
+        assembled_video = torch.cat(video_parts, dim=2).contiguous()
+        assembled_audio = torch.cat(audio_parts, dim=-1).contiguous()
+        expected_tokens = _h3_video_tokens_for_total_frames(latent_total_frames)
+        if int(assembled_video.shape[2]) != expected_tokens:
+            raise RuntimeError(
+                "Internal H3 timeline reconstruction produced an incorrect video length."
+            )
+        if int(assembled_audio.shape[-1]) != total_audio_ticks:
+            raise RuntimeError(
+                "Internal H3 timeline reconstruction produced an incorrect audio length."
+            )
+
+        base_video = {"samples": assembled_video}
+        if bool(latent_upscale):
+            try:
+                from custom_nodes.Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d import (
+                    MinimaxH3LatentUpscaler3D,
+                    UpscaleMode,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "Final Windowed Latent Upscale requires LBH-123-AI/"
+                    "Comfyui_Minimax_h3_latent_Upscaler to be installed."
+                ) from error
+            upscaled_video = MinimaxH3LatentUpscaler3D.execute(
+                latent=base_video,
+                model_name=str(upscaler_model),
+                mode={
+                    "mode": UpscaleMode.TARGET_DIMENSIONS,
+                    "width": int(final_width),
+                    "height": int(final_height),
+                },
+                align=32,
+                enable_chunking=bool(temporal_windowing),
+                device="cuda",
+                precision="fp16",
+            )[0]
+        else:
+            upscaled_video = base_video
+
+        final_latent = LTXVConcatAVLatent.execute(
+            upscaled_video, {"samples": assembled_audio}
+        )[0]
+        source_width = int(assembled_video.shape[-1]) * 16
+        source_height = int(assembled_video.shape[-2]) * 16
+        target = upscaled_video["samples"]
+        target_width = int(target.shape[-1]) * 16
+        target_height = int(target.shape[-2]) * 16
+        status = (
+            f"Assembled {len(segments)} base scenes into {latent_total_frames} latent "
+            f"frames for {delivered_total} delivered frames "
+            f"({expected_tokens} video tokens, {total_audio_ticks} audio ticks); "
+            f"removed {removed_video_tokens} repeated/padded video tokens and "
+            f"{removed_audio_ticks} repeated/padded audio ticks; "
+            f"{source_width}x{source_height} -> {target_width}x{target_height}; "
+            f"temporal windowing {'on' if temporal_windowing and latent_upscale else 'off'}; "
+            "no second diffusion pass; original audio latent preserved."
+        )
+        return (final_latent, delivered_total, status)
+
+
+class SimpleH3FinalTimelineTrim:
+    """Remove only the final H3 temporal-grid padding after complete AV decode."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "delivered_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 1000000,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
+    RETURN_NAMES = ("images", "audio", "status")
+    FUNCTION = "trim"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Trim the decoded windowed-upscale result to the exact manifest duration. "
+        "Only terminal H3 grid padding is removed; scene boundaries are untouched."
+    )
+
+    def trim(self, images, audio, delivered_frames):
+        frames = int(delivered_frames)
+        available = int(images.shape[0])
+        if available < frames:
+            raise ValueError(
+                f"Final timeline decode produced {available} frames; expected at least {frames}."
+            )
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        sample_rate = int(audio.get("sample_rate", 0)) if isinstance(audio, dict) else 0
+        if waveform is None or sample_rate <= 0:
+            raise ValueError("Final Timeline Trim requires a valid ComfyUI AUDIO value.")
+        target_samples = int(round(frames / 24.0 * sample_rate))
+        if int(waveform.shape[-1]) < target_samples:
+            raise ValueError(
+                f"Final audio decode produced {int(waveform.shape[-1])} samples; "
+                f"expected at least {target_samples}."
+            )
+        trimmed_audio = dict(audio)
+        trimmed_audio["waveform"] = waveform[..., :target_samples].contiguous()
+        removed = available - frames
+        return (
+            images[:frames].contiguous(),
+            trimmed_audio,
+            f"Delivered exactly {frames} frames at 24 fps; removed {removed} final "
+            "H3 grid-padding frames and matched the audio tail.",
+        )
+
+
+class SimpleH3FinalWindowedRefineAdvanced:
+    """Advanced H3 refinement over an assembled latent using protected AV windows."""
+
+    WINDOW_FRAMES = [90, 141, 192, 243, 294, 345, 396]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "assembled_latent": ("LATENT",),
+                "delivered_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 1000000,
+                }),
+                "refine": ("BOOLEAN", {"default": False}),
+                "add_noise": (["enable", "disable"], {"default": "enable"}),
+                "noise_seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 100.0,
+                    "step": 0.1, "round": 0.01,
+                }),
+                "sampler_name": (
+                    comfy.samplers.KSampler.SAMPLERS,
+                    {"default": "res_multistep"},
+                ),
+                "scheduler": (
+                    comfy.samplers.KSampler.SCHEDULERS,
+                    {"default": "simple"},
+                ),
+                "start_at_step": ("INT", {
+                    "default": 6, "min": 0, "max": 10000,
+                }),
+                "end_at_step": ("INT", {
+                    "default": 10000, "min": 0, "max": 10000,
+                }),
+                "return_with_leftover_noise": (["disable", "enable"], {
+                    "default": "disable",
+                }),
+                "window_frames": (cls.WINDOW_FRAMES, {
+                    "default": 243,
+                    "tooltip": (
+                        "Exact H3 AV-aligned temporal window. Adjacent windows share "
+                        "39 protected frames; 243 is the recommended first test."
+                    ),
+                }),
+                "audio_output": (["original", "refined"], {
+                    "default": "original",
+                    "tooltip": (
+                        "original restores the complete audio latent from the base "
+                        "generation. refined keeps the audio produced by every "
+                        "refinement window and removes its repeated 39-frame overlap."
+                    ),
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "STRING")
+    RETURN_NAMES = ("refined_latent", "delivered_frames", "status")
+    FUNCTION = "refine_windowed"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Optional KSampler Advanced-style refinement after the complete base timeline "
+        "has been assembled and upscaled. It processes exact AV-aligned windows, "
+        "protects the previous refined 39-frame tail in every later window, joins "
+        "latents without crossfade, and can preserve either the original complete "
+        "audio or the audio refined inside the same temporal windows."
+    )
+
+    def refine_windowed(
+        self, model, positive, negative, assembled_latent, delivered_frames,
+        refine, add_noise, noise_seed, steps, cfg, sampler_name, scheduler,
+        start_at_step, end_at_step, return_with_leftover_noise, window_frames,
+        audio_output="original",
+    ):
+        if not bool(refine):
+            return (
+                assembled_latent,
+                int(delivered_frames),
+                "Windowed Advanced refine off; assembled upscale passed through unchanged.",
+            )
+        try:
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
+            import nodes as comfy_nodes
+        except Exception as error:
+            raise RuntimeError(
+                "Windowed Advanced refinement requires ComfyUI's native joint AV nodes."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(assembled_latent)
+        full_video, full_audio = separated[0], separated[1]
+        video = full_video["samples"]
+        audio = full_audio["samples"]
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if audio.ndim == 3:
+            audio = audio.unsqueeze(0)
+        if video.shape[0] != 1 or audio.shape[0] != 1:
+            raise ValueError("Windowed Advanced refinement currently supports batch size 1.")
+
+        window_tokens = _h3_video_tokens_for_total_frames(int(window_frames))
+        overlap_frames = 39
+        overlap_tokens = _h3_video_tokens_for_total_frames(overlap_frames)
+        stride_tokens = window_tokens - overlap_tokens
+        stride_frames = int(window_frames) - overlap_frames
+        stride_audio = int(round(stride_frames / 24.0 * 40.0))
+        window_audio = int(round(int(window_frames) / 24.0 * 40.0))
+        if stride_tokens <= 0 or stride_audio <= 0:
+            raise ValueError("The refinement window must be longer than 39 frames.")
+        if abs(stride_frames / 24.0 * 40.0 - stride_audio) > 1e-6:
+            raise ValueError(
+                "The selected refinement window is not aligned to the shared H3 AV grid."
+            )
+
+        schedule_steps = max(1, int(steps))
+        schedule_start = max(0, min(int(start_at_step), schedule_steps - 1))
+        requested_end = int(end_at_step)
+        schedule_end = (
+            schedule_steps if requested_end >= 10000
+            else max(schedule_start + 1, min(requested_end, schedule_steps))
+        )
+        total_tokens = int(video.shape[2])
+        total_audio = int(audio.shape[-1])
+        refined_video_parts = []
+        refined_audio_parts = []
+        previous_refined = None
+        start_token = 0
+        start_audio = 0
+        window_index = 0
+
+        while start_token < total_tokens:
+            end_token = min(total_tokens, start_token + window_tokens)
+            token_count = end_token - start_token
+            from .masked_context import _pixel_frames
+            current_frames = _pixel_frames(token_count)
+            current_audio_count = int(round(current_frames / 24.0 * 40.0))
+            end_audio = min(total_audio, start_audio + current_audio_count)
+            if end_audio - start_audio != current_audio_count:
+                raise ValueError(
+                    "The assembled audio latent is shorter than its refinement window."
+                )
+            window_video = {
+                "samples": video[:, :, start_token:end_token].contiguous()
+            }
+            window_audio_latent = {
+                "samples": audio[..., start_audio:end_audio].contiguous()
+            }
+            current = LTXVConcatAVLatent.execute(
+                window_video, window_audio_latent
+            )[0]
+            if previous_refined is not None:
+                current, _ = apply_masked_video_continuation(
+                    current, previous_refined, context_frames=overlap_frames
+                )
+
+            sampled = comfy_nodes.common_ksampler(
+                model,
+                (int(noise_seed) + window_index) & 0xffffffffffffffff,
+                schedule_steps,
+                float(cfg),
+                str(sampler_name),
+                str(scheduler),
+                positive,
+                negative,
+                current,
+                denoise=1.0,
+                disable_noise=str(add_noise) == "disable",
+                start_step=schedule_start,
+                last_step=schedule_end,
+                force_full_denoise=(
+                    str(return_with_leftover_noise) == "disable"
+                ),
+            )[0]
+            sampled_parts = LTXVSeparateAVLatent.execute(sampled)
+            sampled_video = sampled_parts[0]["samples"]
+            sampled_audio = sampled_parts[1]["samples"]
+            if sampled_video.ndim == 4:
+                sampled_video = sampled_video.unsqueeze(0)
+            if sampled_audio.ndim == 3:
+                sampled_audio = sampled_audio.unsqueeze(0)
+            if previous_refined is None:
+                refined_video_parts.append(sampled_video.detach().cpu().contiguous())
+                refined_audio_parts.append(sampled_audio.detach().cpu().contiguous())
+            else:
+                refined_video_parts.append(
+                    sampled_video[:, :, overlap_tokens:].detach().cpu().contiguous()
+                )
+                overlap_audio = int(round(overlap_frames / 24.0 * 40.0))
+                refined_audio_parts.append(
+                    sampled_audio[..., overlap_audio:].detach().cpu().contiguous()
+                )
+            previous_refined = sampled
+            window_index += 1
+            if end_token >= total_tokens:
+                break
+            start_token += stride_tokens
+            start_audio += stride_audio
+
+        refined_video = torch.cat(refined_video_parts, dim=2)
+        if int(refined_video.shape[2]) != total_tokens:
+            raise RuntimeError(
+                f"Windowed refinement reconstructed {int(refined_video.shape[2])} "
+                f"video tokens; expected {total_tokens}."
+            )
+        selected_audio = audio.detach().cpu().contiguous()
+        audio_note = "original complete audio latent restored"
+        if str(audio_output) == "refined":
+            selected_audio = torch.cat(refined_audio_parts, dim=-1).contiguous()
+            if int(selected_audio.shape[-1]) != total_audio:
+                raise RuntimeError(
+                    f"Windowed refinement reconstructed {int(selected_audio.shape[-1])} "
+                    f"audio ticks; expected {total_audio}."
+                )
+            audio_note = "refined window audio joined after removing 39-frame overlaps"
+        result = LTXVConcatAVLatent.execute(
+            {"samples": refined_video}, {"samples": selected_audio}
+        )[0]
+        _chain._LOG.info(
+            "Simple H3 final window refine complete: %d windows; audio_output=%s; %s.",
+            window_index, str(audio_output), audio_note,
+        )
+        return (
+            result,
+            int(delivered_frames),
+            (
+                f"Refined {window_index} overlapping AV windows of up to "
+                f"{int(window_frames)} frames; protected 39 frames between windows; "
+                f"advanced steps {schedule_start}->{schedule_end} of {schedule_steps}; "
+                f"{audio_note}; no crossfade."
+            ),
+        )
+
+
+class SimpleH3FinalLatentWindowDecodeAssemble:
+    """Decode final video latents in overlapping windows and assemble one MP4."""
+
+    WINDOW_FRAMES = [90, 141, 192, 243, 294, 345, 396]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "manifest": (_chain.MANIFEST_TYPE,),
+                "final_latent": ("LATENT",),
+                "video_vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "delivered_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 1000000,
+                }),
+                "window_frames": (cls.WINDOW_FRAMES, {"default": 90}),
+                "filename": ("STRING", {"default": "%date:yyyy-MM-dd%_refined"}),
+                "save_output": ("BOOLEAN", {"default": True}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_path", "status")
+    FUNCTION = "decode_and_assemble"
+    OUTPUT_NODE = True
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Decode the final H3 video latent through overlapping temporal windows, "
+        "write and release one small video part at a time, trim only the terminal "
+        "grid padding, then stream-copy the parts and mux the synchronized audio."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("NaN")
+
+    def decode_and_assemble(
+        self, manifest, final_latent, video_vae, audio_vae, delivered_frames,
+        window_frames, filename, save_output, unique_id=None,
+    ):
+        try:
+            from comfy_extras.nodes_lt import LTXVSeparateAVLatent
+            from comfy_extras.nodes_audio import vae_decode_audio
+        except Exception as error:
+            raise RuntimeError(
+                "Final Latent Window Decode requires ComfyUI's native H3 AV nodes."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(final_latent)
+        video = separated[0]["samples"]
+        audio = separated[1]["samples"]
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if audio.ndim == 3:
+            audio = audio.unsqueeze(0)
+        if video.ndim != 5 or audio.ndim != 4:
+            raise ValueError(
+                "Final Latent Window Decode received invalid H3 AV shapes: "
+                f"video={tuple(video.shape)}, audio={tuple(audio.shape)}."
+            )
+        if int(video.shape[0]) != 1 or int(audio.shape[0]) != 1:
+            raise ValueError("Final Latent Window Decode currently supports batch size 1.")
+
+        frames = int(delivered_frames)
+        selected_window = int(window_frames)
+        window_tokens = _h3_video_tokens_for_total_frames(selected_window)
+        overlap_frames = 39
+        overlap_tokens = _h3_video_tokens_for_total_frames(overlap_frames)
+        stride_tokens = window_tokens - overlap_tokens
+        stride_frames = selected_window - overlap_frames
+        if stride_tokens <= 0 or stride_frames <= 0:
+            raise ValueError("Final decode window must be longer than 39 frames.")
+
+        from .masked_context import _pixel_frames
+        latent_frames = _pixel_frames(int(video.shape[2]))
+        if latent_frames < frames:
+            raise ValueError(
+                f"Final video latent decodes to {latent_frames} frames; "
+                f"the manifest requires {frames}."
+            )
+
+        # Audio is tiny compared with decoded video frames. Decode it once so
+        # native whole-track normalization remains stable and window joins do
+        # not introduce gain changes or AAC priming gaps.
+        decoded_audio = vae_decode_audio(
+            audio_vae, {"samples": audio.contiguous()}
+        )
+        waveform = decoded_audio["waveform"]
+        sample_rate = int(decoded_audio["sample_rate"])
+        required_samples = int(round(frames / 24.0 * sample_rate))
+        if int(waveform.shape[-1]) < required_samples:
+            waveform = F.pad(
+                waveform, (0, required_samples - int(waveform.shape[-1]))
+            )
+        else:
+            waveform = waveform[..., :required_samples].contiguous()
+
+        run_name = _safe_run_name(manifest.get("run_name", "h3_chain"))
+        run_dir = _chain._absolute_output_path(run_name)
+        preview_dir = os.path.join(run_dir, "previews", "refined")
+        final_dir = os.path.join(run_dir, "final")
+        os.makedirs(preview_dir, exist_ok=True)
+        os.makedirs(final_dir, exist_ok=True)
+        transaction = uuid.uuid4().hex
+        for old_name in os.listdir(preview_dir):
+            old_path = os.path.join(preview_dir, old_name)
+            if os.path.isfile(old_path):
+                _chain._safe_unlink(old_path)
+
+        final_name = _chain._safe_name(
+            _expand_date_tokens(str(filename)), "refined_final"
+        )
+        final_path = _chain._versioned_path(
+            os.path.join(final_dir, final_name + ".mp4"), transaction
+        )
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("Final Latent Window Decode requires ffmpeg.")
+
+        window_paths = []
+        concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
+        video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
+        wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
+        final_tmp = os.path.join(final_dir, f".{transaction}.tmp.mp4")
+        emitted = 0
+        start_token = 0
+        window_index = 0
+        completed = False
+        try:
+            while start_token < int(video.shape[2]) and emitted < frames:
+                end_token = min(
+                    int(video.shape[2]), start_token + window_tokens
+                )
+                token_count = end_token - start_token
+                decoded_count = _pixel_frames(token_count)
+                window_latent = video[:, :, start_token:end_token].contiguous()
+                images = video_vae.decode(window_latent)
+                if images.ndim == 5:
+                    images = images.reshape(
+                        -1, images.shape[-3], images.shape[-2], images.shape[-1]
+                    )
+                if int(images.shape[0]) < decoded_count:
+                    raise ValueError(
+                        f"Final VAE window {window_index + 1} returned "
+                        f"{int(images.shape[0])} frames; expected {decoded_count}."
+                    )
+                images = images[:decoded_count]
+                head = 0 if window_index == 0 else overlap_frames
+                if int(images.shape[0]) <= head:
+                    raise ValueError(
+                        f"Final VAE window {window_index + 1} contains no new frames "
+                        "after its 39-frame overlap."
+                    )
+                available = int(images.shape[0]) - head
+                wanted = min(available, frames - emitted)
+                delivered = images[head:head + wanted].contiguous()
+                part_path = os.path.join(
+                    preview_dir,
+                    f"window_{window_index + 1:04d}.{transaction}.mp4",
+                )
+                _chain._write_segment_video(
+                    delivered, part_path, 24, 20,
+                    metadata={
+                        "title": f"Refined decode window {window_index + 1}",
+                        "comment": (
+                            f"delivered frames {emitted + 1}-{emitted + wanted} "
+                            f"of {frames}; decoded {decoded_count}; overlap {head}"
+                        ),
+                    },
+                )
+                window_paths.append(part_path)
+                emitted += wanted
+                window_index += 1
+                del delivered, images, window_latent
+                if emitted >= frames or end_token >= int(video.shape[2]):
+                    break
+                start_token += stride_tokens
+
+            if emitted != frames:
+                raise RuntimeError(
+                    f"Windowed final decode emitted {emitted} frames; expected {frames}."
+                )
+            with open(concat_path, "w", encoding="utf-8") as handle:
+                for path in window_paths:
+                    escaped = path.replace("\\", "\\\\").replace("'", "'\\''")
+                    handle.write(f"file '{escaped}'\n")
+            _chain._run_ffmpeg([
+                ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_path,
+                "-c", "copy", "-movflags", "+faststart", video_tmp,
+            ])
+            _chain._write_wav(
+                {"waveform": waveform, "sample_rate": sample_rate}, wav_tmp
+            )
+            _chain._run_ffmpeg([
+                ffmpeg, "-y", "-i", video_tmp, "-i", wav_tmp,
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "256k",
+                "-t", f"{frames / 24.0:.9f}",
+                "-movflags", "+faststart", final_tmp,
+            ])
+            os.replace(final_tmp, final_path)
+            completed = True
+
+            status = (
+                f"Decoded and released {window_index} overlapping latent windows; "
+                f"assembled exactly {frames} frames with stable whole-track audio "
+                f"-> {final_path}"
+            )
+            if not bool(save_output):
+                temporary = os.path.join(
+                    preview_dir,
+                    f"temporary_refined_preview.{uuid.uuid4().hex}.mp4",
+                )
+                os.replace(final_path, temporary)
+                final_path = temporary
+                SimpleH3ChainAssemble._remove_completed_run(
+                    manifest, keep_path=final_path
+                )
+                status += "; published temporary final and removed recovery artifacts"
+
+            videos = [_chain._video_output_item(final_path)]
+            _chain._LOG.info("Simple H3 %s", status)
+            return {
+                "ui": {"videos": videos, "text": [status]},
+                "result": (final_path, status),
+            }
+        finally:
+            for path in (concat_path, video_tmp, wav_tmp, final_tmp):
+                _chain._safe_unlink(path)
+            if completed:
+                for path in window_paths:
+                    _chain._safe_unlink(path)
+
+
+class SimpleH3FinalWindowPreviewAssemble:
+    """Persist small refined previews and publish one transactionally joined final."""
+
+    WINDOW_FRAMES = [90, 141, 192, 243, 294, 345, 396]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "manifest": (_chain.MANIFEST_TYPE,),
+                "images": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "delivered_frames": ("INT", {"default": 1, "min": 1, "max": 1000000}),
+                "window_frames": (cls.WINDOW_FRAMES, {"default": 90}),
+                "filename": ("STRING", {"default": "%date:yyyy-MM-dd%_refined"}),
+                "save_output": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "base_video_path": ("STRING", {
+                    "tooltip": (
+                        "Optional ordering dependency from the base assembler. "
+                        "It guarantees the base final is complete before refined cleanup."
+                    ),
+                }),
+                "save_base_output": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Keep or remove the completed base comparison video.",
+                }),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_path", "status")
+    FUNCTION = "assemble"
+    OUTPUT_NODE = True
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Writes the refined result in small sequential MP4 windows internally, joins "
+        "them into one final MP4, and publishes only that complete final video. It "
+        "removes temporary previews and base recovery artifacts only after assembly "
+        "when cleanup is enabled."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("NaN")
+
+    def assemble(self, manifest, images, audio, delivered_frames, window_frames,
+                 filename, save_output, base_video_path=None,
+                 save_base_output=True, unique_id=None):
+        frames = int(delivered_frames)
+        if int(images.shape[0]) < frames:
+            raise ValueError(
+                f"Refined preview received {int(images.shape[0])} frames; expected {frames}."
+            )
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        sample_rate = int(audio.get("sample_rate", 0)) if isinstance(audio, dict) else 0
+        if waveform is None or sample_rate <= 0:
+            raise ValueError("Refined Window Preview requires a valid ComfyUI AUDIO value.")
+        images = images[:frames]
+        required_samples = int(round(frames / 24.0 * sample_rate))
+        if int(waveform.shape[-1]) < required_samples:
+            raise ValueError("Refined Window Preview audio is shorter than the video timeline.")
+        waveform = waveform[..., :required_samples]
+
+        plan_run = str(manifest.get("run_name") or "h3_chain")
+        run_dir = _chain._absolute_output_path(plan_run)
+        preview_dir = os.path.join(run_dir, "previews", "refined")
+        final_dir = os.path.join(run_dir, "final")
+        os.makedirs(preview_dir, exist_ok=True)
+        os.makedirs(final_dir, exist_ok=True)
+        transaction = uuid.uuid4().hex
+        # Retain the current run's cards long enough for browser playback;
+        # previews from the preceding execution are the safe ones to reap.
+        for old_name in os.listdir(preview_dir):
+            old_path = os.path.join(preview_dir, old_name)
+            if os.path.isfile(old_path):
+                _chain._safe_unlink(old_path)
+        final_name = _chain._safe_name(
+            _expand_date_tokens(str(filename)), "refined_final"
+        )
+        final_path = _chain._versioned_path(
+            os.path.join(final_dir, final_name + ".mp4"), transaction
+        )
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("Refined Window Preview + Assemble requires ffmpeg.")
+
+        window_paths = []
+        concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
+        video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
+        wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
+        final_tmp = os.path.join(final_dir, f".{transaction}.tmp.mp4")
+        try:
+            for index, start in enumerate(range(0, frames, int(window_frames)), 1):
+                stop = min(frames, start + int(window_frames))
+                path = os.path.join(
+                    preview_dir, f"window_{index:04d}.{transaction}.mp4"
+                )
+                silent_path = path + ".silent.mp4"
+                window_wav = path + ".wav"
+                _chain._write_segment_video(
+                    images[start:stop], silent_path, 24, 20,
+                    metadata={
+                        "title": f"Refined window {index}",
+                        "comment": f"frames {start + 1}-{stop} of {frames}",
+                    },
+                )
+                audio_start = int(round(start / 24.0 * sample_rate))
+                audio_stop = int(round(stop / 24.0 * sample_rate))
+                _chain._write_wav({
+                    "waveform": waveform[..., audio_start:audio_stop],
+                    "sample_rate": sample_rate,
+                }, window_wav)
+                _chain._run_ffmpeg([
+                    ffmpeg, "-y", "-i", silent_path, "-i", window_wav,
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-t", f"{(stop - start) / 24.0:.9f}",
+                    "-movflags", "+faststart", path,
+                ])
+                _chain._safe_unlink(silent_path)
+                _chain._safe_unlink(window_wav)
+                window_paths.append(path)
+            with open(concat_path, "w", encoding="utf-8") as handle:
+                for path in window_paths:
+                    escaped = path.replace("\\", "\\\\").replace("'", "'\\''")
+                    handle.write(f"file '{escaped}'\n")
+            _chain._run_ffmpeg([
+                ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_path,
+                "-c", "copy", "-movflags", "+faststart", video_tmp,
+            ])
+            fitted_audio = {"waveform": waveform, "sample_rate": sample_rate}
+            _chain._write_wav(fitted_audio, wav_tmp)
+            _chain._run_ffmpeg([
+                ffmpeg, "-y", "-i", video_tmp, "-i", wav_tmp,
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "256k", "-t", f"{frames / 24.0:.9f}",
+                "-movflags", "+faststart", final_tmp,
+            ])
+            os.replace(final_tmp, final_path)
+
+            status = (
+                f"Encoded {len(window_paths)} internal refined windows and assembled "
+                f"the complete {frames}-frame final video -> {final_path}"
+            )
+
+            if not bool(save_output):
+                preview_dir = os.path.join(run_dir, "previews", "refined")
+                os.makedirs(preview_dir, exist_ok=True)
+                for old_name in os.listdir(preview_dir):
+                    if not old_name.startswith("temporary_refined_preview."):
+                        continue
+                    old_path = os.path.join(preview_dir, old_name)
+                    if os.path.isfile(old_path):
+                        _chain._safe_unlink(old_path)
+                preview_path = os.path.join(
+                    preview_dir,
+                    f"temporary_refined_preview.{uuid.uuid4().hex}.mp4"
+                )
+                os.replace(final_path, preview_path)
+                final_path = preview_path
+                retained = [final_path]
+                if base_video_path and bool(save_base_output):
+                    retained.append(os.path.abspath(str(base_video_path)))
+                SimpleH3ChainAssemble._remove_completed_run(
+                    manifest, keep_paths=retained
+                )
+                status += (
+                    "; temporary final preview published and base recovery artifacts removed"
+                )
+            if base_video_path and not bool(save_base_output):
+                _chain._safe_unlink(os.path.abspath(str(base_video_path)))
+                status += "; base comparison output removed"
+            videos = [_chain._video_output_item(final_path)]
+            if (_chain.PromptServer is not None and
+                    _chain.PromptServer.instance is not None):
+                _chain.PromptServer.instance.send_sync(
+                    "simple_h3_chain_review_resolved", {
+                        "token": transaction,
+                        "node_id": str(unique_id),
+                        "action": "final",
+                        "status": status,
+                        "final_video": _chain._video_output_item(final_path),
+                    },
+                    _chain.PromptServer.instance.client_id,
+                )
+            _chain._LOG.info("Simple H3 %s", status)
+            return {"ui": {"videos": videos, "text": [status]},
+                    "result": (final_path, status)}
+        finally:
+            for path in (concat_path, video_tmp, wav_tmp, final_tmp):
+                _chain._safe_unlink(path)
+
+
 NODE_CLASS_MAPPINGS = {
     "SimpleH3OptionalLoraLoader": SimpleH3OptionalLoraLoader,
     "SimpleH3LatentUpscaleResolution": SimpleH3LatentUpscaleResolution,
     "SimpleH3LatentUpscaleRefine": SimpleH3LatentUpscaleRefine,
     "SimpleH3LatentUpscaleRefineAdvanced": SimpleH3LatentUpscaleRefineAdvanced,
     "SimpleH3LatentUpscaleRefineMasked": SimpleH3LatentUpscaleRefineMasked,
+    "SimpleH3FinalWindowedLatentUpscale": SimpleH3FinalWindowedLatentUpscale,
+    "SimpleH3FinalTimelineTrim": SimpleH3FinalTimelineTrim,
+    "SimpleH3FinalWindowedRefineAdvanced": SimpleH3FinalWindowedRefineAdvanced,
+    "SimpleH3FinalLatentWindowDecodeAssemble": SimpleH3FinalLatentWindowDecodeAssemble,
+    "SimpleH3FinalWindowPreviewAssemble": SimpleH3FinalWindowPreviewAssemble,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
     "SimpleH3ChainContext": SimpleH3ChainContext,
+    "SimpleH3BaseContextDecode": SimpleH3BaseContextDecode,
     "SimpleH3CutReferenceSheet": SimpleH3CutReferenceSheet,
     "SimpleH3SelectContinuityFrames": SimpleH3SelectContinuityFrames,
     "SimpleH3LoopTrim": SimpleH3LoopTrim,
     "SimpleH3ChainSegmentSave": SimpleH3ChainSegmentSave,
     "SimpleH3ChainReview": SimpleH3ChainReview,
+    "SimpleH3BasePreview": SimpleH3BasePreview,
     "SimpleH3ChainLoopEnd": SimpleH3ChainLoopEnd,
     "SimpleH3ChainAssemble": SimpleH3ChainAssemble,
+    "SimpleH3BasePreviewAssemble": SimpleH3BasePreviewAssemble,
     "SimpleH3ChainManifestLoad": SimpleH3ChainManifestLoad,
     "SimpleH3StoryboardSheetPrompt": SimpleH3StoryboardSheetPrompt,
     "SimpleH3StoryboardPromptList": SimpleH3StoryboardPromptList,
@@ -2193,17 +3448,25 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3LatentUpscaleRefine": "Simple H3 Latent Upscale + Refine — Optional",
     "SimpleH3LatentUpscaleRefineAdvanced": "Simple H3 Latent Upscale + Refine — Advanced",
     "SimpleH3LatentUpscaleRefineMasked": "Simple H3 Latent Upscale + Refine — Masked Continuity (Experimental)",
+    "SimpleH3FinalWindowedLatentUpscale": "Simple H3 Final Latent Upscale — Windowed (Experimental)",
+    "SimpleH3FinalTimelineTrim": "Simple H3 Final Timeline Trim",
+    "SimpleH3FinalWindowedRefineAdvanced": "Simple H3 Final Latent Refine — Windowed Advanced (Experimental)",
+    "SimpleH3FinalLatentWindowDecodeAssemble": "Simple H3 Final Latent — Window Decode + Assemble",
+    "SimpleH3FinalWindowPreviewAssemble": "Simple H3 Refined Final Preview + Assemble",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
     "SimpleH3ChainContext": "Simple H3 Context — Masked AV / Masked Cut",
+    "SimpleH3BaseContextDecode": "Simple H3 Base Context Decode — Full / Tail Only",
     "SimpleH3CutReferenceSheet": "Simple H3 Cut Reference Sheet",
     "SimpleH3SelectContinuityFrames": "Simple H3 Select Continuity Frames",
     "SimpleH3LoopTrim": "Simple H3 Trim + Lock Audio",
     "SimpleH3ChainSegmentSave": "Simple H3 Save Scene + Checkpoint",
     "SimpleH3ChainReview": "Simple H3 Review — Approve / Retry / Reroll / Stop",
+    "SimpleH3BasePreview": "Simple H3 Base Preview — Auto Continue + Final",
     "SimpleH3ChainLoopEnd": "Simple H3 Loop Until Final Scene",
     "SimpleH3ChainAssemble": "Simple H3 Assemble Final Video",
+    "SimpleH3BasePreviewAssemble": "Simple H3 Base Preview — Assemble Safely",
     "SimpleH3ChainManifestLoad": "Simple H3 Recover Chain",
     "SimpleH3StoryboardSheetPrompt": "Simple H3 Storyboard Sheet Prompt",
     "SimpleH3StoryboardPromptList": "Simple H3 Individual Storyboard Prompts",

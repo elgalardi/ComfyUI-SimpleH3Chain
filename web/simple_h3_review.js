@@ -1,7 +1,12 @@
 import {app} from "/scripts/app.js";
 import {api} from "/scripts/api.js";
 
-const NODE_NAME = "SimpleH3ChainReview";
+const NODE_NAMES = new Set([
+    "SimpleH3ChainReview",
+    "SimpleH3BasePreview",
+    "SimpleH3FinalWindowPreviewAssemble",
+    "SimpleH3FinalLatentWindowDecodeAssemble",
+]);
 const mounted = new Set();
 let pollTimer = null;
 
@@ -15,10 +20,10 @@ function nodes() {
 
 function findNode(data) {
     const exact = app.graph?.getNodeById?.(data?.node_id);
-    if (nodeType(exact) === NODE_NAME) return exact;
+    if (NODE_NAMES.has(nodeType(exact))) return exact;
     const execution = app.graph?.getNodeById?.(data?.execution_id);
-    if (nodeType(execution) === NODE_NAME) return execution;
-    return nodes().find((node) => nodeType(node) === NODE_NAME) ?? null;
+    if (NODE_NAMES.has(nodeType(execution))) return execution;
+    return nodes().find((node) => NODE_NAMES.has(nodeType(node))) ?? null;
 }
 
 function mediaKey(item, revision = "") {
@@ -128,6 +133,38 @@ function resolveReview(data) {
     setBusy(node, true);
 }
 
+function showExecutionOutput(data) {
+    const nodeId = data?.node ?? data?.node_id ?? data?.execution_id;
+    const node = app.graph?.getNodeById?.(nodeId);
+    if (!node || !NODE_NAMES.has(nodeType(node))) return;
+    if (!node._simpleH3Mounted) mount(node);
+
+    const output = data?.output ?? data ?? {};
+    const videos = output.videos ?? output.gifs ?? [];
+    const item = videos.at?.(-1) ?? videos[videos.length - 1];
+    if (!item?.filename) return;
+
+    // `executed` is emitted once the transactionally assembled file exists.
+    // A fresh revision guarantees that a repeated filename is reloaded.
+    loadMedia(
+        node,
+        item,
+        `executed:${data?.prompt_id ?? ""}:${Date.now()}`,
+    );
+    const isFinal = [
+        "SimpleH3FinalWindowPreviewAssemble",
+        "SimpleH3FinalLatentWindowDecodeAssemble",
+    ].includes(nodeType(node));
+    node._simpleH3Title.textContent = isFinal
+        ? "Refined final video"
+        : "Generated preview";
+    node._simpleH3Badge.textContent = isFinal
+        ? "final assembled video"
+        : "video preview";
+    const text = Array.isArray(output.text) ? output.text.join("\n") : output.text;
+    node._simpleH3Status.textContent = text || "Video ready.";
+}
+
 async function fetchPending() {
     try {
         const response = await api.fetchApi("/simple_h3_chain/reviews");
@@ -214,10 +251,30 @@ function mount(node) {
     stop.style.background = "#64333d";
     actions.append(approve, retry, reroll, stop);
 
+    const automatic = nodeType(node) !== "SimpleH3ChainReview";
+    if (automatic) {
+        prompt.style.display = "none";
+        seedRow.style.display = "none";
+        actions.style.display = "none";
+        title.textContent = [
+            "SimpleH3FinalWindowPreviewAssemble",
+            "SimpleH3FinalLatentWindowDecodeAssemble",
+        ].includes(nodeType(node))
+            ? "Waiting for the complete refined video"
+            : "Waiting for a generated scene";
+    }
+
     const status = style(document.createElement("div"), {
         minHeight: "20px", color: "#aeb7c8", whiteSpace: "pre-wrap",
     });
-    status.textContent = "The player will receive each saved scene automatically.";
+    status.textContent = [
+        "SimpleH3FinalWindowPreviewAssemble",
+        "SimpleH3FinalLatentWindowDecodeAssemble",
+    ].includes(nodeType(node))
+        ? "The player will show only the complete assembled refined video."
+        : automatic
+            ? "Automatic preview: each item appears here and the final video replaces it."
+            : "The player will receive each saved scene automatically.";
 
     root.append(header, video, prompt, seedRow, actions, status);
     const widget = node.addDOMWidget("simple_h3_review", "simple-h3-review", root, {
@@ -247,12 +304,13 @@ function mount(node) {
 
 api.addEventListener("simple_h3_chain_review", (event) => showReview(event.detail));
 api.addEventListener("simple_h3_chain_review_resolved", (event) => resolveReview(event.detail));
+api.addEventListener("executed", (event) => showExecutionOutput(event.detail));
 api.addEventListener("status", fetchPending);
 
 app.registerExtension({
     name: "simple_h3_chain.review",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_NAME) return;
+        if (!NODE_NAMES.has(nodeData.name)) return;
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = created?.apply(this, arguments);
@@ -261,10 +319,10 @@ app.registerExtension({
         };
     },
     async nodeCreated(node) {
-        if (nodeType(node) === NODE_NAME) mount(node);
+        if (NODE_NAMES.has(nodeType(node))) mount(node);
     },
     async afterConfigureGraph() {
-        for (const node of nodes()) if (nodeType(node) === NODE_NAME) mount(node);
+        for (const node of nodes()) if (NODE_NAMES.has(nodeType(node))) mount(node);
         await fetchPending();
     },
 });

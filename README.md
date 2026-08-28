@@ -45,9 +45,88 @@ either the untouched base audio (`original`) or the audio produced by the extra
 sampling pass (`refined`). Continue routing
 `delivery_latent` to decode and `context_latent` to Segment Save and Loop End.
 
+`Simple H3 Final Latent Upscale — Windowed (Experimental)` is a separate
+post-chain experiment. Connect the completed manifest from Loop End. It loads
+the saved base-latent checkpoints only after every scene has finished, removes
+the repeated 39-frame Masked AV heads and any H3 grid padding, rebuilds one
+exact delivered AV timeline, and applies the learned 3D upscaler with temporal
+windowing. It deliberately performs no second diffusion pass and preserves the
+original audio latent. This keeps low-resolution Masked AV continuity entirely
+independent from the final upscale and avoids per-scene upscale resets.
+Because an arbitrary delivered duration does not always end on an H3 latent
+token boundary, the upscale retains the smallest required terminal grid
+padding. The recommended final sink, `Simple H3 Final Latent — Window Decode +
+Assemble`, removes that padding while decoding instead of materializing the
+complete movie as one IMAGE tensor.
+
+The final sink decodes overlapping latent windows sequentially, drops the
+repeated 39-frame head from every later window, writes temporary silent window
+MP4s, and releases each decoded tensor before moving to the next window. It
+decodes the much smaller audio timeline once to preserve whole-track level and
+normalization, then concatenates the video parts and muxes that audio into the
+final movie. The embedded player receives only the completed result.
+`save_output=false` publishes a temporary final preview and cleans base recovery
+artifacts after successful verification. Window parts are removed after a
+successful assembly and retained on failure for diagnosis. This route replaces
+the old full video decode, full audio decode, terminal trim, and VHS Combine
+chain, so long outputs no longer require all decoded frames in memory at once.
+
+`Simple H3 Base Preview — Auto Continue + Final` is the matching simplified
+monitor for the low-resolution base chain. It has no approval/retry controls:
+each saved scene appears automatically, execution continues, and the downstream
+base assembler returns the complete base movie to the same player. Its filename
+and `save_output` outputs directly control that assembler.
+
+`Simple H3 Chain Plan.base_preview` is the master switch for the complete base
+branch. Disabled, it decodes only the exact 39-frame Masked AV visual tail,
+writes transactional latent checkpoints and prompt metadata, skips every base
+MP4, and drives the scene-preview monitor in bypass mode. Enabled, it decodes
+and displays each complete low-resolution scene. The refined workflow connects
+the completed manifest directly to final windowed upscale/refinement; a separate
+base-video assembler is not required.
+
+`Simple H3 Final Latent Refine — Windowed Advanced (Experimental)` optionally
+sits between the final windowed upscaler and the decoders. It exposes native
+Advanced sampler controls (`add_noise`, schedule steps, `start_at_step`,
+`end_at_step`, and leftover noise), processes AV-aligned temporal windows, and
+protects the preceding refined 39-frame tail in every later window. The windows
+are concatenated in latent space without a crossfade. `audio_output=original`
+restores the untouched complete base-audio latent; `audio_output=refined` keeps
+the audio sampled in every refinement window and removes its repeated 39-frame
+span before joining. Start with a 243-frame window and a late 6→8 refinement
+schedule.
+
 Required optional dependency:
 [`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler),
 with a compatible model in `ComfyUI/models/latent_upscale_models`.
+
+## Output layout
+
+The plan's `output_name` is the run folder. New runs do not add an intermediate
+`h3_chains` directory. For example, `output_name=sexyai` keeps the complete run
+under `ComfyUI/output/sexyai`:
+
+```text
+output/sexyai/
+|-- checkpoints/          # transactional latent and metadata checkpoints
+|-- previews/
+|   |-- base/             # optional low-resolution scene/base previews
+|   `-- refined/          # internal refined windows or temporary refined final
+|-- final/                # retained base/refined final videos
+|-- frames/               # optional PNG export sequences
+|-- source/               # copied source media when required by the plan
+|-- reviews/              # review media when the interactive gate is used
+|-- partial/              # optional partial manifests
+|-- plan.json
+|-- workflow.json
+|-- api_prompt.json
+`-- manifest.json
+```
+
+Folders that are not used by a workflow are not created. Scene preview files
+replace their matching scene on reruns, while final videos keep versioned names.
+The legacy `output/h3_chains` tree is left untouched and remains readable by the
+gallery and checkpoint recovery endpoints.
 
 ## Clean-cut continuity mode
 

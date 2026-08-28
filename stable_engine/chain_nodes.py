@@ -919,8 +919,8 @@ def _output_root() -> str:
 
 def _run_dir(plan: dict[str, Any]) -> str:
     root = _output_root()
-    path = os.path.abspath(os.path.join(root, "h3_chains", plan["run_name"]))
-    if os.path.commonpath([root, path]) != root:
+    path = os.path.abspath(os.path.join(root, plan["run_name"]))
+    if os.path.commonpath([root, path]) != root or path == root:
         raise ValueError("H3 chain run path escapes the ComfyUI output directory.")
     return path
 
@@ -962,8 +962,13 @@ def _publish_final_review_preview(
     """Replace the last scene preview with the assembled Simple H3 video."""
     if manifest.get("format") != "h3_chain_manifest_v3":
         return
-    pending = _PENDING_FINAL_REVIEW_PREVIEWS.pop(
-        _final_review_preview_key(manifest), None)
+    # Keep the routing entry available for the duration of the execution.
+    # ComfyUI can evaluate an output assembler once inside the recursive graph
+    # and once again at the top level.  The second evaluation may replace a
+    # temporary MP4, so it must also republish the new path instead of leaving
+    # the player pointing at the first (now removed) file.
+    pending = _PENDING_FINAL_REVIEW_PREVIEWS.get(
+        _final_review_preview_key(manifest))
     if pending is None or PromptServer is None or PromptServer.instance is None:
         return
     payload = {
@@ -987,7 +992,9 @@ def _artifact_paths(plan: dict[str, Any], index: int) -> dict[str, str]:
     run_dir = _run_dir(plan)
     return {
         "run_dir": run_dir,
-        "segment": os.path.join(run_dir, "segments", "clip_%04d.mp4" % index),
+        "segment": os.path.join(
+            run_dir, "previews", "base", "clip_%04d.mp4" % index
+        ),
         "checkpoint": os.path.join(run_dir, "checkpoints",
                                    "clip_%04d.safetensors" % index),
         "metadata": os.path.join(run_dir, "checkpoints", "clip_%04d.json" % index),
@@ -1274,8 +1281,13 @@ def _verify_segment_artifacts(segment: dict[str, Any], index: int) -> None:
         raise ValueError(
             "H3 chain metadata slot %d points to segment index %r." %
             (index, segment.get("index")))
-    for key, hash_key in (("segment", "segment_sha256"),
-                          ("checkpoint", "checkpoint_sha256")):
+    # A latent-only run intentionally has no encoded scene MP4. The checkpoint
+    # remains mandatory because it is the transactional recovery source and the
+    # input to final windowed upscale/refinement.
+    artifact_pairs = [("checkpoint", "checkpoint_sha256")]
+    if segment.get("segment") or segment.get("segment_sha256"):
+        artifact_pairs.insert(0, ("segment", "segment_sha256"))
+    for key, hash_key in artifact_pairs:
         value = segment.get(key)
         expected_hash = str(segment.get(hash_key) or "")
         if not isinstance(value, str) or not expected_hash:
@@ -2450,6 +2462,31 @@ class MiniMaxH3ChainSegmentSave:
                    "plus a safetensors resume checkpoint, exact prompt metadata, "
                    "and workflow recovery sidecars.")
 
+    @staticmethod
+    def _encode_scene_preview(prompt: Any) -> bool:
+        """Return false only for an explicitly configured latent-only graph."""
+        if not isinstance(prompt, dict):
+            return True
+        preview_flags = []
+        assembly_flags = []
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get("class_type") or "")
+            inputs = node.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                continue
+            if class_type == "SimpleH3BasePreview":
+                preview_flags.append(bool(inputs.get("show_scene_previews", True)))
+            elif class_type == "SimpleH3BasePreviewAssemble":
+                assembly_flags.append(bool(inputs.get("assemble_base_video", True)))
+        # Missing controls preserve the historical safe behavior. Skipping the
+        # MP4 is allowed only when both downstream consumers explicitly opt out.
+        return not (
+            preview_flags and assembly_flags and
+            not any(preview_flags) and not any(assembly_flags)
+        )
+
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("NaN")
@@ -2463,11 +2500,17 @@ class MiniMaxH3ChainSegmentSave:
         shot = plan["shots"][index - 1]
         actual_frames = int(images.shape[0])
         expected_frames = int(shot["delivered_frames"])
-        if actual_frames != expected_frames:
+        base_preview = bool(plan.get("base_preview", True))
+        expected_images = (
+            expected_frames if base_preview else
+            int(plan["compatibility"]["context_length"])
+        )
+        if actual_frames != expected_images:
             raise ValueError(
-                "H3 chain clip %d produced %d delivered frames; expected %d. "
-                "Wire decoded images through MiniMax H3 Contex Loop Trim before "
-                "Segment Save." % (index, actual_frames, expected_frames))
+                "H3 chain clip %d supplied %d decoded frames; expected %d for "
+                "base_preview=%s. Wire the video latent through Simple H3 Base "
+                "Context Decode and Simple H3 Trim." %
+                (index, actual_frames, expected_images, base_preview))
 
         mode = plan["compatibility"]["audio_mode"]
         if mode in ("generated_audio", "source_intro_generated") and audio is None:
@@ -2523,7 +2566,11 @@ class MiniMaxH3ChainSegmentSave:
                 tensors["masked_raw_audio"] = _tensor_cpu_clone(raw_waveform)
 
         paths = _artifact_paths(plan, index)
-        os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
+        encode_scene_preview = bool(plan.get(
+            "base_preview", self._encode_scene_preview(prompt)
+        ))
+        if encode_scene_preview:
+            os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
         os.makedirs(os.path.dirname(paths["checkpoint"]), exist_ok=True)
         archives = _write_run_archives(plan, prompt, extra_pnginfo)
         previous_metadata = None
@@ -2535,9 +2582,14 @@ class MiniMaxH3ChainSegmentSave:
                              index, exc)
 
         transaction = uuid.uuid4().hex
-        published_segment = _versioned_path(paths["segment"], transaction)
+        published_segment = (
+            _versioned_path(paths["segment"], transaction)
+            if encode_scene_preview else None
+        )
         published_checkpoint = _versioned_path(paths["checkpoint"], transaction)
-        published_prompt = os.path.splitext(published_segment)[0] + ".prompt.txt"
+        published_prompt = os.path.splitext(
+            published_segment or published_checkpoint
+        )[0] + ".prompt.txt"
         checkpoint_tmp = "%s.%s.tmp" % (published_checkpoint, uuid.uuid4().hex)
         committed = False
         try:
@@ -2550,9 +2602,10 @@ class MiniMaxH3ChainSegmentSave:
                 "h3_prompt": shot["prompt"],
                 "h3_seed": str(shot["seed"]),
             })
-            _write_segment_video(
-                images, published_segment, FPS, plan["segment_crf"],
-                metadata=video_metadata)
+            if published_segment is not None:
+                _write_segment_video(
+                    images, published_segment, FPS, plan["segment_crf"],
+                    metadata=video_metadata)
             _atomic_text(published_prompt, shot["prompt"])
             _st_save(tensors, checkpoint_tmp, metadata={
                 "format": "h3_chain_checkpoint_v3",
@@ -2570,7 +2623,6 @@ class MiniMaxH3ChainSegmentSave:
             segment = {
                 "index": index,
                 "id": shot["id"],
-                "segment": _relative_output_path(published_segment),
                 "checkpoint": _relative_output_path(published_checkpoint),
                 "metadata": _relative_output_path(paths["metadata"]),
                 "prompt_file": _relative_output_path(published_prompt),
@@ -2582,10 +2634,12 @@ class MiniMaxH3ChainSegmentSave:
                 "seed": shot["seed"],
                 "steps": shot["steps"],
                 "sample_rate": sample_rate,
-                "segment_sha256": _file_sha256(published_segment),
                 "checkpoint_sha256": _file_sha256(published_checkpoint),
                 "prompt_file_sha256": _file_sha256(published_prompt),
             }
+            if published_segment is not None:
+                segment["segment"] = _relative_output_path(published_segment)
+                segment["segment_sha256"] = _file_sha256(published_segment)
             metadata = {
                 "format": "h3_chain_segment_v3",
                 "run_name": plan["run_name"],
@@ -2602,16 +2656,25 @@ class MiniMaxH3ChainSegmentSave:
         finally:
             _safe_unlink(checkpoint_tmp)
             if not committed:
-                _safe_unlink(published_segment)
+                if published_segment is not None:
+                    _safe_unlink(published_segment)
                 _safe_unlink(published_checkpoint)
                 _safe_unlink(published_prompt)
 
         _cleanup_previous_artifacts(
             plan, index, previous_metadata,
-            {published_segment, published_checkpoint, published_prompt})
-        status = ("saved clip %d/%d: %s + checkpoint %s" %
-                  (index, len(plan["shots"]), published_segment,
-                   published_checkpoint))
+            {value for value in (
+                published_segment, published_checkpoint, published_prompt
+            ) if value})
+        if published_segment is None:
+            status = (
+                "saved latent-only clip %d/%d: checkpoint %s; base MP4 preview disabled"
+                % (index, len(plan["shots"]), published_checkpoint)
+            )
+        else:
+            status = ("saved clip %d/%d: %s + checkpoint %s" %
+                      (index, len(plan["shots"]), published_segment,
+                       published_checkpoint))
         _LOG.info("H3 Chain %s", status)
         return {"ui": {"text": [status]}, "result": (segment, status)}
 
@@ -3218,7 +3281,21 @@ class MiniMaxH3ChainLoopEnd:
             node = graph.lookup_node(clone_id)
             for key, value in original.get("inputs", {}).items():
                 if is_link(value) and value[0] in contained:
-                    parent = graph.lookup_node(value[0])
+                    # Loop End is deliberately cloned under the reserved
+                    # ``Recurse`` id. Final output nodes (assemblers/previews)
+                    # can legitimately consume its manifest, so their parent
+                    # link must follow that renamed clone instead of looking
+                    # up the original display id and receiving None.
+                    parent_id = (
+                        "Recurse" if str(value[0]) == unique_id else value[0]
+                    )
+                    parent = graph.lookup_node(parent_id)
+                    if parent is None:
+                        raise RuntimeError(
+                            "H3 Chain recursive graph could not resolve parent "
+                            "%s (cloned as %s) for node %s input %s."
+                            % (value[0], parent_id, node_id, key)
+                        )
                     node.set_input(key, parent.out(value[1]))
                 else:
                     node.set_input(key, value)
@@ -3843,7 +3920,7 @@ def _new_export_directory(manifest: dict[str, Any], export_name: str) -> str:
     run_name = _safe_name(manifest.get("run_name"), "h3_chain")
     name = _safe_name(export_name, "png_sequence")
     base = os.path.abspath(os.path.join(
-        _output_root(), "h3_chains", run_name, "frames", name))
+        _output_root(), run_name, "frames", name))
     root = _output_root()
     if os.path.commonpath([root, base]) != root:
         raise ValueError("H3 PNG export path escapes the ComfyUI output directory.")
@@ -3897,7 +3974,7 @@ class MiniMaxH3ChainExportPNG:
                                "exactly match the first decode."}),
                 "export_name": ("STRING", {
                     "default": "png_sequence",
-                    "tooltip": "Folder name under output/h3_chains/<run>/frames. "
+                    "tooltip": "Folder name under output/<run>/frames. "
                                "An existing folder is never overwritten; a "
                                "numbered sibling is created automatically."}),
                 "first_frame_number": ("INT", {
@@ -4167,7 +4244,7 @@ class MiniMaxH3ChainAssemble:
             audio = _audio_with_prelude(audio, extension_frames, prelude)
 
         run_name = _safe_name(manifest.get("run_name"), "h3_chain")
-        run_dir = os.path.join(_output_root(), "h3_chains", run_name)
+        run_dir = os.path.join(_output_root(), run_name)
         final_dir = os.path.join(run_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         final_name = _safe_name(filename, "final")
@@ -4387,8 +4464,16 @@ async def _list_saved_checkpoints(request):
     if not run_name:
         return web.json_response(
             {"error": "A non-empty H3 chain run_name is required."}, status=400)
-    checkpoint_dir = os.path.join(
-        _output_root(), "h3_chains", run_name, "checkpoints")
+    run_dir = os.path.join(_output_root(), run_name)
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    # Recovery remains able to read runs made before the direct output layout.
+    # New executions never write through this legacy branch.
+    if not os.path.isdir(checkpoint_dir):
+        legacy_run_dir = os.path.join(_output_root(), "h3_chains", run_name)
+        legacy_checkpoint_dir = os.path.join(legacy_run_dir, "checkpoints")
+        if os.path.isdir(legacy_checkpoint_dir):
+            run_dir = legacy_run_dir
+            checkpoint_dir = legacy_checkpoint_dir
     checkpoints = []
     if os.path.isdir(checkpoint_dir):
         for filename in sorted(os.listdir(checkpoint_dir)):
@@ -4403,20 +4488,23 @@ async def _list_saved_checkpoints(request):
                 index = int(segment.get("index", int(match.group(1))))
                 if index != int(match.group(1)):
                     continue
-                segment_path = _absolute_output_path(segment["segment"])
+                segment_value = segment.get("segment")
+                segment_path = (
+                    _absolute_output_path(segment_value)
+                    if isinstance(segment_value, str) and segment_value else None
+                )
                 checkpoint_path = _absolute_output_path(segment["checkpoint"])
-                ready = (os.path.isfile(segment_path) and
-                         os.path.isfile(checkpoint_path))
+                ready = os.path.isfile(checkpoint_path)
                 item = {
                     "scene": index,
                     "scene_id": str(segment.get("id") or "clip_%04d" % index),
                     "resume_scene": index + 1,
                     "ready": ready,
                 }
-                if os.path.isfile(segment_path):
+                if segment_path and os.path.isfile(segment_path):
                     item["video"] = _video_output_item(segment_path)
                 partial_path = os.path.join(
-                    _output_root(), "h3_chains", run_name, "final",
+                    run_dir, "final",
                     "partial_through_clip_%04d.mp4" % index)
                 if os.path.isfile(partial_path):
                     item["partial_video"] = _video_output_item(partial_path)
@@ -4458,14 +4546,27 @@ async def _list_studio_gallery(request):
             "metadata": indexed.get("metadata"),
         })
 
-    chains_root = os.path.join(output_root, "h3_chains")
-    if os.path.isdir(chains_root):
-        for current_root, _dirs, filenames in os.walk(chains_root):
-            if os.path.basename(current_root).lower() != "final":
+    # Current Simple H3 runs live directly under output/<run_name>/final.
+    # Keep scanning the legacy output/h3_chains tree as well so older gallery
+    # items remain visible after this layout migration.
+    for entry in os.listdir(output_root):
+        run_root = os.path.join(output_root, entry)
+        if not os.path.isdir(run_root):
+            continue
+        candidate_roots = (
+            [os.path.join(run_root, "final")]
+            if entry != "h3_chains" else
+            [os.path.join(run_root, name, "final")
+             for name in os.listdir(run_root)
+             if os.path.isdir(os.path.join(run_root, name))]
+        )
+        for final_root in candidate_roots:
+            if not os.path.isdir(final_root):
                 continue
-            for filename in filenames:
-                file_path = os.path.join(current_root, filename)
-                if os.path.splitext(filename)[1].lower() in video_extensions:
+            for filename in os.listdir(final_root):
+                file_path = os.path.join(final_root, filename)
+                if (os.path.isfile(file_path) and
+                        os.path.splitext(filename)[1].lower() in video_extensions):
                     add_file(file_path, "video")
 
     for folder_name, extensions, kind in (

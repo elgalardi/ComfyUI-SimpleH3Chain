@@ -34,3 +34,23 @@ app.registerExtension({
         };
     },
 });
+
+// delivered_frames is commonly converted to an input, but LiteGraph still
+// serializes its hidden numeric widget. Older experimental workflow exports
+// omitted that placeholder and shifted window_frames/filename/save_output.
+app.registerExtension({
+    name: "SimpleH3Chain.refinedPreviewMigration",
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "SimpleH3FinalWindowPreviewAssemble") return;
+        const originalOnConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const values = Array.isArray(info?.widgets_values)
+                ? [...info.widgets_values]
+                : null;
+            if (values?.length === 3 && [90, 141, 192, 243, 294, 345, 396].includes(values[0])) {
+                info = {...info, widgets_values: [1, ...values]};
+            }
+            return originalOnConfigure?.apply(this, [info]);
+        };
+    },
+});

@@ -277,7 +277,7 @@ def apply_masked_video_continuation(
     result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
     _LOG.info(
         "Simple H3 refined masked video continuity: %d frames, %d protected video "
-        "steps; audio untouched.",
+        "steps; audio unmasked and available to the refinement sampler.",
         preserved, video_steps,
     )
     return result, preserved
