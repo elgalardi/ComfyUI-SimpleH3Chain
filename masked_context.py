@@ -222,3 +222,62 @@ def apply_masked_av_continuation(
         max(0, min(int(audio_feather_ticks), audio_steps)),
     )
     return result, preserved
+
+
+def apply_masked_video_continuation(
+    target_latent, source_latent, context_frames=39
+):
+    """Protect a previous refined video tail without conditioning the audio stream."""
+    try:
+        import comfy.nested_tensor
+        from comfy.model_base import MiniMaxH3
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "This ComfyUI build lacks native MiniMax H3 mask support."
+        ) from error
+
+    if not callable(getattr(MiniMaxH3, "scale_latent_inpaint", None)):
+        raise RuntimeError(
+            "This ComfyUI build cannot apply MiniMax H3 video masks."
+        )
+
+    _ensure_av_mask_payload_compat()
+    target_video, target_audio = _streams(target_latent)
+    source_video, _source_audio = _streams(source_latent)
+    if target_video.shape[0] != 1 or source_video.shape[0] != 1:
+        raise ValueError("Refined Masked continuity currently supports batch size 1.")
+
+    target_frames = _pixel_frames(target_video.shape[2])
+    source_frames = _pixel_frames(source_video.shape[2])
+    preserved = _exact_av_context(context_frames, source_frames, target_frames)
+    video_steps = 2 + 5 * ((preserved - 5) // 17)
+    if tuple(source_video.shape[1:2] + source_video.shape[3:]) != tuple(
+        target_video.shape[1:2] + target_video.shape[3:]
+    ):
+        raise ValueError(
+            "Refined Masked continuity requires identical upscale resolution."
+        )
+
+    out_video = target_video.clone()
+    out_video[:, :, :video_steps] = source_video[:, :, -video_steps:].to(
+        device=out_video.device, dtype=out_video.dtype
+    )
+    video_mask = torch.ones(
+        (1, 1, out_video.shape[2], out_video.shape[3], out_video.shape[4]),
+        device=out_video.device, dtype=torch.float32,
+    )
+    video_mask[:, :, :video_steps] = 0.0
+    audio_mask = torch.ones(
+        (1, 1, target_audio.shape[2], target_audio.shape[3]),
+        device=target_audio.device, dtype=torch.float32,
+    )
+
+    result = target_latent.copy()
+    result["samples"] = comfy.nested_tensor.NestedTensor((out_video, target_audio))
+    result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+    _LOG.info(
+        "Simple H3 refined masked video continuity: %d frames, %d protected video "
+        "steps; audio untouched.",
+        preserved, video_steps,
+    )
+    return result, preserved

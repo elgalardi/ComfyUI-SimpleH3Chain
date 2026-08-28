@@ -36,6 +36,15 @@ KSampler Advanced semantics. For an 8-step plan, starting at step 3 evaluates
 five high-resolution steps. Leave `end_at_step` at 10000 to finish the schedule
 and remove leftover noise.
 
+`Simple H3 Latent Upscale + Refine — Masked Continuity (Experimental)` keeps
+the original Advanced node untouched. Connect `state` from Simple H3 Current
+Scene. The first clip initializes a separate refined-resolution history; later
+clips protect the previous refined 39-frame video tail during refinement. Audio
+is not copied or masked by this second continuity layer. `audio_output` selects
+either the untouched base audio (`original`) or the audio produced by the extra
+sampling pass (`refined`). Continue routing
+`delivery_latent` to decode and `context_latent` to Segment Save and Loop End.
+
 Required optional dependency:
 [`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler),
 with a compatible model in `ComfyUI/models/latent_upscale_models`.

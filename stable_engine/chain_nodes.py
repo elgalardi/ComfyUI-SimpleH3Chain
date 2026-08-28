@@ -1371,6 +1371,11 @@ def _load_resume_state(plan: dict[str, Any], start_clip: int) -> dict[str, Any]:
         "index": start_clip,
         "previous_frames": tensors["context_frames"],
         "previous_latent": {"samples": [tensors["video"], tensors["audio"]]},
+        "previous_refined_latent": (
+            {"samples": [tensors["refined_video"], tensors["refined_audio"]]}
+            if "refined_video" in tensors and "refined_audio" in tensors
+            else None
+        ),
         "segments": segments,
         "resumed_from": previous_index,
     }
@@ -1398,6 +1403,7 @@ def _initial_state(plan: dict[str, Any], start_clip: int,
                 external_context.get("context_frames")
                 if isinstance(external_context, dict) else None),
             "previous_latent": None,
+            "previous_refined_latent": None,
             "previous_audio": (
                 external_context.get("context_audio")
                 if isinstance(external_context, dict) else None),
@@ -2477,6 +2483,11 @@ class MiniMaxH3ChainSegmentSave:
             "video": parts[0],
             "audio": parts[1],
         }
+        refined_latent = sampled_latent.get("_simple_h3_refined_latent")
+        if isinstance(refined_latent, dict):
+            refined_parts = _compact_latent(refined_latent)["samples"]
+            tensors["refined_video"] = refined_parts[0]
+            tensors["refined_audio"] = refined_parts[1]
         sample_rate = 0
         if audio is not None:
             waveform, sample_rate = _validate_audio(
@@ -3251,6 +3262,11 @@ class MiniMaxH3ChainLoopEnd:
             # clone: a tensor view would retain the entire decoded clip
             "previous_frames": _tensor_cpu_clone(images[-context_length:]),
             "previous_latent": _compact_latent(sampled_latent),
+            "previous_refined_latent": (
+                _compact_latent(sampled_latent["_simple_h3_refined_latent"])
+                if isinstance(sampled_latent.get("_simple_h3_refined_latent"), dict)
+                else None
+            ),
             "segments": list(state.get("segments", [])) +
                         [_public_segment(segment)],
             "resumed_from": state.get("resumed_from", 0),

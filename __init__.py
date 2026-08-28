@@ -32,7 +32,10 @@ from .image_nodes import (
     NODE_CLASS_MAPPINGS as _IMAGE_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as _IMAGE_NODE_DISPLAY_NAME_MAPPINGS,
 )
-from .masked_context import apply_masked_av_continuation
+from .masked_context import (
+    apply_masked_av_continuation,
+    apply_masked_video_continuation,
+)
 
 
 class _SplitTrim(int):
@@ -2024,11 +2027,141 @@ class SimpleH3LatentUpscaleRefineAdvanced(SimpleH3LatentUpscaleRefine):
         )
 
 
+class SimpleH3LatentUpscaleRefineMasked(SimpleH3LatentUpscaleRefineAdvanced):
+    """Experimental Advanced refine with a protected high-resolution video prefix."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        inputs["required"]["audio_output"] = (["original", "refined"], {
+            "default": "original",
+            "tooltip": (
+                "original restores the untouched audio latent from the base generation. "
+                "refined delivers the audio produced by the extra Advanced sampling pass."
+            ),
+        })
+        inputs["optional"] = {
+            "state": (_chain.STATE_TYPE, {
+                "tooltip": (
+                    "Connect Simple H3 Current Scene state. From scene two onward, the "
+                    "previous refined 39-frame tail becomes a protected video prefix."
+                ),
+            }),
+        }
+        return inputs
+
+    FUNCTION = "upscale_refine_masked"
+    DESCRIPTION = (
+        "Experimental isolated variant of Advanced. It preserves the previous refined "
+        "39-frame video tail during the next high-resolution pass while leaving native "
+        "low-resolution Masked AV and audio unchanged."
+    )
+
+    def upscale_refine_masked(
+        self, model, positive, negative, sampled_latent, latent_upscale,
+        upscaler_model, final_width, final_height, add_noise, noise_seed,
+        steps, cfg, sampler_name, scheduler, start_at_step, end_at_step,
+        return_with_leftover_noise, audio_output, state=None,
+    ):
+        if not bool(latent_upscale):
+            return (sampled_latent, sampled_latent, "Latent upscale off; native latent delivered.")
+
+        try:
+            from custom_nodes.Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d import (
+                MinimaxH3LatentUpscaler3D,
+                UpscaleMode,
+            )
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
+            import nodes as comfy_nodes
+        except Exception as error:
+            raise RuntimeError(
+                "Simple H3 latent upscale requires LBH-123-AI/"
+                "Comfyui_Minimax_h3_latent_Upscaler to be installed."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(sampled_latent)
+        video_latent, audio_latent = separated[0], separated[1]
+        source_shape = tuple(video_latent["samples"].shape)
+        upscaled_video = MinimaxH3LatentUpscaler3D.execute(
+            latent=video_latent,
+            model_name=str(upscaler_model),
+            mode={
+                "mode": UpscaleMode.TARGET_DIMENSIONS,
+                "width": int(final_width),
+                "height": int(final_height),
+            },
+            align=32,
+            enable_chunking=True,
+            device="cuda",
+            precision="fp16",
+        )[0]
+        combined = LTXVConcatAVLatent.execute(upscaled_video, audio_latent)[0]
+
+        previous_refined = (
+            state.get("previous_refined_latent")
+            if isinstance(state, dict) else None
+        )
+        refined_continuation = previous_refined is not None
+        if refined_continuation:
+            combined, _ = apply_masked_video_continuation(
+                combined,
+                previous_refined,
+                context_frames=39,
+            )
+
+        schedule_steps = max(1, int(steps))
+        schedule_start = max(0, min(int(start_at_step), schedule_steps - 1))
+        requested_end = int(end_at_step)
+        schedule_end = (
+            schedule_steps if requested_end >= 10000
+            else max(schedule_start + 1, min(requested_end, schedule_steps))
+        )
+        refined = comfy_nodes.common_ksampler(
+            model,
+            int(noise_seed),
+            schedule_steps,
+            float(cfg),
+            str(sampler_name),
+            str(scheduler),
+            positive,
+            negative,
+            combined,
+            denoise=1.0,
+            disable_noise=str(add_noise) == "disable",
+            start_step=schedule_start,
+            last_step=schedule_end,
+            force_full_denoise=str(return_with_leftover_noise) == "disable",
+        )[0]
+
+        refined_streams = LTXVSeparateAVLatent.execute(refined)
+        refined_video, refined_audio = refined_streams[0], refined_streams[1]
+        selected_audio = (
+            refined_audio if str(audio_output) == "refined" else audio_latent
+        )
+        delivery = LTXVConcatAVLatent.execute(refined_video, selected_audio)[0]
+        context = dict(sampled_latent)
+        context["_simple_h3_refined_latent"] = delivery
+        target_shape = tuple(refined_video["samples"].shape)
+        return (
+            delivery,
+            context,
+            (
+                f"H3 refined masked upscale {source_shape[-1] * 16}x{source_shape[-2] * 16} "
+                f"-> {target_shape[-1] * 16}x{target_shape[-2] * 16}; "
+                f"advanced steps {schedule_start}->{schedule_end} of {schedule_steps}; "
+                f"refined 39-frame continuity "
+                f"{'active' if refined_continuation else 'initialized'}; "
+                f"audio output {str(audio_output)}."
+            ),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "SimpleH3OptionalLoraLoader": SimpleH3OptionalLoraLoader,
     "SimpleH3LatentUpscaleResolution": SimpleH3LatentUpscaleResolution,
     "SimpleH3LatentUpscaleRefine": SimpleH3LatentUpscaleRefine,
     "SimpleH3LatentUpscaleRefineAdvanced": SimpleH3LatentUpscaleRefineAdvanced,
+    "SimpleH3LatentUpscaleRefineMasked": SimpleH3LatentUpscaleRefineMasked,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
@@ -2059,6 +2192,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3LatentUpscaleResolution": "Simple H3 Latent Upscale — Resolution",
     "SimpleH3LatentUpscaleRefine": "Simple H3 Latent Upscale + Refine — Optional",
     "SimpleH3LatentUpscaleRefineAdvanced": "Simple H3 Latent Upscale + Refine — Advanced",
+    "SimpleH3LatentUpscaleRefineMasked": "Simple H3 Latent Upscale + Refine — Masked Continuity (Experimental)",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
