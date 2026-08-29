@@ -3100,6 +3100,7 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
         concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
         video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
         wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
+        metadata_tmp = os.path.join(final_dir, f".{transaction}.metadata.txt")
         final_tmp = os.path.join(final_dir, f".{transaction}.tmp.mp4")
         emitted = 0
         start_token = 0
@@ -3170,12 +3171,16 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
             _chain._write_wav(
                 {"waveform": waveform, "sample_rate": sample_rate}, wav_tmp
             )
+            media_metadata = _chain._manifest_media_metadata(manifest)
+            _chain._write_ffmetadata(metadata_tmp, media_metadata)
             _chain._run_ffmpeg([
                 ffmpeg, "-y", "-i", video_tmp, "-i", wav_tmp,
+                "-f", "ffmetadata", "-i", metadata_tmp,
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "256k",
                 "-t", f"{frames / 24.0:.9f}",
-                "-movflags", "+faststart", final_tmp,
+                "-map_metadata", "2",
+                "-movflags", "use_metadata_tags+faststart", final_tmp,
             ])
             os.replace(final_tmp, final_path)
             completed = True
@@ -3204,7 +3209,9 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
                 "result": (final_path, status),
             }
         finally:
-            for path in (concat_path, video_tmp, wav_tmp, final_tmp):
+            for path in (
+                concat_path, video_tmp, wav_tmp, metadata_tmp, final_tmp,
+            ):
                 _chain._safe_unlink(path)
             if completed:
                 for path in window_paths:
@@ -3304,6 +3311,7 @@ class SimpleH3FinalWindowPreviewAssemble:
         concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
         video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
         wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
+        metadata_tmp = os.path.join(final_dir, f".{transaction}.metadata.txt")
         final_tmp = os.path.join(final_dir, f".{transaction}.tmp.mp4")
         try:
             for index, start in enumerate(range(0, frames, int(window_frames)), 1):
@@ -3346,11 +3354,15 @@ class SimpleH3FinalWindowPreviewAssemble:
             ])
             fitted_audio = {"waveform": waveform, "sample_rate": sample_rate}
             _chain._write_wav(fitted_audio, wav_tmp)
+            media_metadata = _chain._manifest_media_metadata(manifest)
+            _chain._write_ffmetadata(metadata_tmp, media_metadata)
             _chain._run_ffmpeg([
                 ffmpeg, "-y", "-i", video_tmp, "-i", wav_tmp,
+                "-f", "ffmetadata", "-i", metadata_tmp,
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "256k", "-t", f"{frames / 24.0:.9f}",
-                "-movflags", "+faststart", final_tmp,
+                "-map_metadata", "2",
+                "-movflags", "use_metadata_tags+faststart", final_tmp,
             ])
             os.replace(final_tmp, final_path)
 
@@ -3403,7 +3415,9 @@ class SimpleH3FinalWindowPreviewAssemble:
             return {"ui": {"videos": videos, "text": [status]},
                     "result": (final_path, status)}
         finally:
-            for path in (concat_path, video_tmp, wav_tmp, final_tmp):
+            for path in (
+                concat_path, video_tmp, wav_tmp, metadata_tmp, final_tmp,
+            ):
                 _chain._safe_unlink(path)
 
 
