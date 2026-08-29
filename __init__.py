@@ -2107,7 +2107,8 @@ class SimpleH3LatentUpscaleRefine:
             model_name=str(upscaler_model),
             mode=mode,
             align=32,
-            enable_chunking=True,
+            enable_temporal_chunking=True,
+            force_unload=True,
             device="cuda",
             precision="fp16",
         )[0]
@@ -2237,7 +2238,8 @@ class SimpleH3LatentUpscaleRefineAdvanced(SimpleH3LatentUpscaleRefine):
             model_name=str(upscaler_model),
             mode=mode,
             align=32,
-            enable_chunking=True,
+            enable_temporal_chunking=True,
+            force_unload=True,
             device="cuda",
             precision="fp16",
         )[0]
@@ -2349,7 +2351,8 @@ class SimpleH3LatentUpscaleRefineMasked(SimpleH3LatentUpscaleRefineAdvanced):
                 "height": int(final_height),
             },
             align=32,
-            enable_chunking=True,
+            enable_temporal_chunking=True,
+            force_unload=True,
             device="cuda",
             precision="fp16",
         )[0]
@@ -2651,7 +2654,8 @@ class SimpleH3FinalWindowedLatentUpscale(SimpleH3LatentUpscaleRefine):
                     "height": int(final_height),
                 },
                 align=32,
-                enable_chunking=bool(temporal_windowing),
+                enable_temporal_chunking=bool(temporal_windowing),
+                force_unload=True,
                 device="cuda",
                 precision="fp16",
             )[0]
