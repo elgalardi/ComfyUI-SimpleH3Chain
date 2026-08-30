@@ -1887,8 +1887,8 @@ class SimpleH3BasePreview(_chain.MiniMaxH3ChainReview):
                 "show_scene_previews": ("BOOLEAN", {
                     "default": True,
                     "tooltip": (
-                        "Show every generated base scene in this player. Disable to "
-                        "pass the scene through without publishing browser previews."
+                        "Show the accumulated base video through the current scene. "
+                        "Disable to pass the scene through without encoding previews."
                     ),
                 }),
             },
@@ -1904,8 +1904,9 @@ class SimpleH3BasePreview(_chain.MiniMaxH3ChainReview):
     FUNCTION = "preview"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Automatically displays every generated base scene, continues without a "
-        "review decision, and receives the complete assembled video in the same player."
+        "Automatically displays one accumulated base preview through the current scene, "
+        "continues without a review decision, and receives the complete assembled video "
+        "in the same player."
     )
 
     async def preview(self, state, segment, filename, save_output,
@@ -1917,15 +1918,37 @@ class SimpleH3BasePreview(_chain.MiniMaxH3ChainReview):
                 "ui": {"text": [status]},
                 "result": (segment, status, str(filename), bool(save_output)),
             }
+        preview_segment = segment
+        partial_warning = ""
+        try:
+            partial_path, partial_warning = _chain._assemble_review_partial(
+                state, segment, "checkpointed", source_audio
+            )
+            preview_segment = dict(segment)
+            preview_segment["segment"] = partial_path
+            preview_segment["delivered_frames"] = sum(
+                int(item.get("delivered_frames", 0))
+                for item in list(state.get("segments", [])) + [segment]
+            )
+            preview_segment["segment_sha256"] = _chain._file_sha256(partial_path)
+            preview_segment["embedded_audio"] = True
+        except Exception as error:
+            partial_warning = f"Accumulated base preview unavailable; showing current scene ({error})"
+            _chain._LOG.warning("Simple H3 %s", partial_warning)
         response = await super().review(
-            state=state, segment=segment, enabled=True, Continue=True,
+            state=state, segment=preview_segment, enabled=True, Continue=True,
             play_notification_sound=False, auto_continue_timeout_minutes=0.0,
             unload_models_while_waiting=False, assemble_partial_on_stop=False,
-            partial_audio_source="checkpointed", audio=audio,
+            partial_audio_source="checkpointed", audio=None,
             source_audio=source_audio, dynprompt=dynprompt, unique_id=unique_id,
         )
         result = tuple(response["result"])
-        response["result"] = result + (str(filename), bool(save_output))
+        status = str(result[1])
+        if partial_warning:
+            status += f"; {partial_warning}"
+        response["result"] = (
+            segment, status, str(filename), bool(save_output)
+        )
         return response
 class SimpleH3LatentUpscaleResolution:
     """Resolve a low-resolution H3 first pass from the requested final size."""
@@ -1955,20 +1978,30 @@ class SimpleH3LatentUpscaleResolution:
                     "default": 32, "min": 16, "max": 256, "step": 16,
                     "tooltip": "Align the generated width and height to the H3 pixel grid.",
                 }),
-            }
+            },
+            "optional": {
+                "refine_without_upscale": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Runs the final refinement pass at the requested native resolution "
+                        "without spatially upscaling the latent."
+                    ),
+                }),
+            },
         }
 
-    RETURN_TYPES = ("INT", "INT", "INT", "INT", "BOOLEAN", "STRING")
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "BOOLEAN", "STRING", "BOOLEAN")
     RETURN_NAMES = (
         "first_pass_width", "first_pass_height", "final_width", "final_height",
-        "latent_upscale", "status",
+        "latent_upscale", "status", "refine",
     )
     FUNCTION = "resolve"
     CATEGORY = "MiniMax H3/Simple Chain/Upscale"
     DESCRIPTION = (
         "Calculates an aligned low-resolution first pass while preserving the user's "
-        "requested final dimensions. Connect the first-pass dimensions to the native H3 "
-        "conditioning node and the final dimensions to Simple H3 Latent Upscale + Refine."
+        "requested final dimensions. It can also request refinement at native resolution "
+        "without resizing the latent. Connect latent_upscale to the windowed upscaler and "
+        "refine to the final refinement node."
     )
 
     @staticmethod
@@ -1976,14 +2009,23 @@ class SimpleH3LatentUpscaleResolution:
         target = float(value) * float(scale)
         return max(int(align) * 2, int(round(target / int(align))) * int(align))
 
-    def resolve(self, width, height, latent_upscale, first_pass_scale, align):
+    def resolve(
+        self, width, height, latent_upscale, first_pass_scale, align,
+        refine_without_upscale=False,
+    ):
         final_width = int(width)
         final_height = int(height)
         enabled = bool(latent_upscale) and float(first_pass_scale) < 0.999
         if not enabled:
+            refine = bool(refine_without_upscale)
             return (
                 final_width, final_height, final_width, final_height, False,
-                f"Latent upscale off: native {final_width}x{final_height}",
+                (
+                    f"Refine only: native {final_width}x{final_height}; no latent resize"
+                    if refine else
+                    f"Latent upscale and refinement off: native {final_width}x{final_height}"
+                ),
+                refine,
             )
 
         first_width = min(
@@ -2005,6 +2047,7 @@ class SimpleH3LatentUpscaleResolution:
                 f"{first_width}x{first_height} -> {final_width}x{final_height} "
                 f"({first_pixels / final_pixels:.1%} first-pass pixels)"
             ),
+            enabled or bool(refine_without_upscale),
         )
 
 
@@ -2872,6 +2915,24 @@ class SimpleH3FinalWindowedRefineAdvanced:
         start_audio = 0
         window_index = 0
 
+        def conditioning_for_refine(conditioning):
+            """Keep text/image semantics but do not reapply generation keyframes."""
+            if not isinstance(conditioning, (list, tuple)):
+                return conditioning
+            refined_conditioning = []
+            for entry in conditioning:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    refined_conditioning.append(entry)
+                    continue
+                metadata = dict(entry[1])
+                # Native I2V keyframes belong to the base-generation grid. The
+                # assembled latent already contains their result; injecting them
+                # again during refinement either causes a spatial mismatch after
+                # upscale or produces a ghosted opening when naively resized.
+                metadata.pop("minimax_keyframes", None)
+                refined_conditioning.append([entry[0], metadata])
+            return refined_conditioning
+
         while start_token < total_tokens:
             end_token = min(total_tokens, start_token + window_tokens)
             token_count = end_token - start_token
@@ -2897,6 +2958,9 @@ class SimpleH3FinalWindowedRefineAdvanced:
                     current, previous_refined, context_frames=overlap_frames
                 )
 
+            window_positive = conditioning_for_refine(positive)
+            window_negative = conditioning_for_refine(negative)
+
             sampled = comfy_nodes.common_ksampler(
                 model,
                 (int(noise_seed) + window_index) & 0xffffffffffffffff,
@@ -2904,8 +2968,8 @@ class SimpleH3FinalWindowedRefineAdvanced:
                 float(cfg),
                 str(sampler_name),
                 str(scheduler),
-                positive,
-                negative,
+                window_positive,
+                window_negative,
                 current,
                 denoise=1.0,
                 disable_noise=str(add_noise) == "disable",
@@ -2975,6 +3039,38 @@ class SimpleH3FinalWindowedRefineAdvanced:
         )
 
 
+def _publish_refined_window_preview(
+    unique_id, transaction, index, count, path, has_audio,
+):
+    if (_chain.PromptServer is None or
+            _chain.PromptServer.instance is None):
+        return
+    _chain.PromptServer.instance.send_sync(
+        "simple_h3_chain_review",
+        {
+            "token": transaction,
+            "node_id": str(unique_id),
+            "execution_id": str(unique_id),
+            "preview_kind": "refined_window",
+            "clip_index": int(index),
+            "clip_count": int(count),
+            "shot_id": f"window_{int(index):04d}",
+            "scene_prompt": "",
+            "seed": "",
+            "video": _chain._video_output_item(path),
+            "has_audio": bool(has_audio),
+            "warning": (
+                f"Refined window {int(index)}/{int(count)} ready; "
+                "the complete video will replace it after assembly."
+            ),
+            "preview_pending": False,
+            "preview_revision": int(index),
+            "auto_continue": True,
+        },
+        _chain.PromptServer.instance.client_id,
+    )
+
+
 class SimpleH3FinalLatentWindowDecodeAssemble:
     """Decode final video latents in overlapping windows and assemble one MP4."""
 
@@ -2995,6 +3091,15 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
                 "filename": ("STRING", {"default": "%date:yyyy-MM-dd%_refined"}),
                 "save_output": ("BOOLEAN", {"default": True}),
             },
+            "optional": {
+                "previews": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Show every decoded refined window with its synchronized audio. "
+                        "Disable to show only the complete assembled final video."
+                    ),
+                }),
+            },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -3005,8 +3110,9 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
     CATEGORY = "MiniMax H3/Simple Chain/Upscale"
     DESCRIPTION = (
         "Decode the final H3 video latent through overlapping temporal windows, "
-        "write and release one small video part at a time, trim only the terminal "
-        "grid padding, then stream-copy the parts and mux the synchronized audio."
+        "publish each isolated window as it becomes available, trim only the terminal "
+        "grid padding, then stream-copy the parts and replace the preview with the "
+        "complete video containing synchronized audio."
     )
 
     @classmethod
@@ -3015,7 +3121,8 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
 
     def decode_and_assemble(
         self, manifest, final_latent, video_vae, audio_vae, delivered_frames,
-        window_frames, filename, save_output, unique_id=None,
+        window_frames, filename, save_output, previews=True,
+        unique_id=None,
     ):
         try:
             from comfy_extras.nodes_lt import LTXVSeparateAVLatent
@@ -3097,6 +3204,13 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
             raise RuntimeError("Final Latent Window Decode requires ffmpeg.")
 
         window_paths = []
+        preview_paths = []
+        expected_windows = max(
+            1,
+            1 + int(math.ceil(
+                max(0, frames - selected_window) / float(stride_frames)
+            )),
+        )
         concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
         video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
         wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
@@ -3149,6 +3263,38 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
                     },
                 )
                 window_paths.append(part_path)
+                if bool(previews):
+                    preview_path = os.path.join(
+                        preview_dir,
+                        f"window_{window_index + 1:04d}.preview.{transaction}.mp4",
+                    )
+                    window_wav = preview_path + ".wav"
+                    audio_start = int(round(emitted / 24.0 * sample_rate))
+                    audio_stop = int(round(
+                        (emitted + wanted) / 24.0 * sample_rate
+                    ))
+                    try:
+                        _chain._write_wav(
+                            {
+                                "waveform": waveform[..., audio_start:audio_stop],
+                                "sample_rate": sample_rate,
+                            },
+                            window_wav,
+                        )
+                        _chain._run_ffmpeg([
+                            ffmpeg, "-y", "-i", part_path, "-i", window_wav,
+                            "-map", "0:v:0", "-map", "1:a:0",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                            "-t", f"{wanted / 24.0:.9f}",
+                            "-movflags", "+faststart", preview_path,
+                        ])
+                    finally:
+                        _chain._safe_unlink(window_wav)
+                    preview_paths.append(preview_path)
+                    _publish_refined_window_preview(
+                        unique_id, transaction, window_index + 1,
+                        expected_windows, preview_path, True,
+                    )
                 emitted += wanted
                 window_index += 1
                 del delivered, images, window_latent
@@ -3188,6 +3334,7 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
             status = (
                 f"Decoded and released {window_index} overlapping latent windows; "
                 f"assembled exactly {frames} frames with stable whole-track audio "
+                f"(window previews {'on' if previews else 'off'}) "
                 f"-> {final_path}"
             )
             if not bool(save_output):
@@ -3203,6 +3350,19 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
                 status += "; published temporary final and removed recovery artifacts"
 
             videos = [_chain._video_output_item(final_path)]
+            if (_chain.PromptServer is not None and
+                    _chain.PromptServer.instance is not None):
+                _chain.PromptServer.instance.send_sync(
+                    "simple_h3_chain_review_resolved",
+                    {
+                        "token": transaction,
+                        "node_id": str(unique_id),
+                        "action": "final",
+                        "status": status,
+                        "final_video": _chain._video_output_item(final_path),
+                    },
+                    _chain.PromptServer.instance.client_id,
+                )
             _chain._LOG.info("Simple H3 %s", status)
             return {
                 "ui": {"videos": videos, "text": [status]},
@@ -3214,8 +3374,153 @@ class SimpleH3FinalLatentWindowDecodeAssemble:
             ):
                 _chain._safe_unlink(path)
             if completed:
-                for path in window_paths:
+                for path in window_paths + preview_paths:
                     _chain._safe_unlink(path)
+
+
+class SimpleH3I2VFinalLatentUpscale(SimpleH3LatentUpscaleRefine):
+    """Direct single-clip I2V upscale without chain checkpoints or base decode."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sampled_latent": ("LATENT",),
+                "latent_upscale": ("BOOLEAN", {"default": True}),
+                "upscaler_model": (cls._models(),),
+                "final_width": ("INT", {
+                    "default": 1280, "min": 64, "max": 4096, "step": 8,
+                }),
+                "final_height": ("INT", {
+                    "default": 720, "min": 64, "max": 4096, "step": 8,
+                }),
+                "temporal_windowing": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "STRING")
+    RETURN_NAMES = ("final_latent", "delivered_frames", "status")
+    FUNCTION = "upscale_i2v"
+    CATEGORY = "MiniMax H3/Simple Chain/Upscale"
+    DESCRIPTION = (
+        "Direct final-only I2V path. It optionally applies the learned 3D latent "
+        "upscaler to one completed AV latent, preserves its original audio, and "
+        "performs no diffusion refinement or intermediate video decode."
+    )
+
+    def upscale_i2v(
+        self, sampled_latent, latent_upscale, upscaler_model, final_width,
+        final_height, temporal_windowing,
+    ):
+        try:
+            from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
+        except Exception as error:
+            raise RuntimeError(
+                "Direct I2V final upscale requires ComfyUI's native joint AV nodes."
+            ) from error
+
+        separated = LTXVSeparateAVLatent.execute(sampled_latent)
+        video_latent, audio_latent = separated[0], separated[1]
+        video = video_latent["samples"]
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+            video_latent = {"samples": video}
+        from .masked_context import _pixel_frames
+        delivered_frames = _pixel_frames(int(video.shape[2]))
+        source_width = int(video.shape[-1]) * 16
+        source_height = int(video.shape[-2]) * 16
+
+        if bool(latent_upscale):
+            try:
+                from custom_nodes.Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d import (
+                    MinimaxH3LatentUpscaler3D,
+                    UpscaleMode,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "Direct I2V final upscale requires LBH-123-AI/"
+                    "Comfyui_Minimax_h3_latent_Upscaler to be installed."
+                ) from error
+            final_video = MinimaxH3LatentUpscaler3D.execute(
+                latent=video_latent,
+                model_name=str(upscaler_model),
+                mode={
+                    "mode": UpscaleMode.TARGET_DIMENSIONS,
+                    "width": int(final_width),
+                    "height": int(final_height),
+                },
+                align=32,
+                enable_temporal_chunking=bool(temporal_windowing),
+                force_unload=True,
+                device="cuda",
+                precision="fp16",
+            )[0]
+        else:
+            final_video = video_latent
+
+        final_latent = LTXVConcatAVLatent.execute(final_video, audio_latent)[0]
+        target = final_video["samples"]
+        target_width = int(target.shape[-1]) * 16
+        target_height = int(target.shape[-2]) * 16
+        status = (
+            f"Direct I2V final latent: {delivered_frames} frames; "
+            f"{source_width}x{source_height} -> {target_width}x{target_height}; "
+            f"latent upscale {'on' if latent_upscale else 'off'}; "
+            "no base decode and no diffusion refine; original audio preserved."
+        )
+        return (final_latent, delivered_frames, status)
+
+
+class SimpleH3I2VFinalDecodeAssemble(SimpleH3FinalLatentWindowDecodeAssemble):
+    """One final I2V windowed decode with no base-manifest dependency."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "final_latent": ("LATENT",),
+                "video_vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "delivered_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 1000000,
+                }),
+                "window_frames": (cls.WINDOW_FRAMES, {"default": 243}),
+                "output_name": ("STRING", {"default": "i2v"}),
+                "filename": ("STRING", {"default": "%date:yyyy-MM-dd%_i2v"}),
+                "save_output": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "previews": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Show isolated decode windows before the final video.",
+                }),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    FUNCTION = "decode_i2v"
+    DESCRIPTION = (
+        "The only MP4 stage in the direct I2V path. It decodes the final AV latent "
+        "in bounded windows and publishes one synchronized final video."
+    )
+
+    def decode_i2v(
+        self, final_latent, video_vae, audio_vae, delivered_frames,
+        window_frames, output_name, filename, save_output, previews=False,
+        unique_id=None,
+    ):
+        manifest = {
+            "format": "h3_i2v_final_v1",
+            "run_name": _safe_run_name(output_name),
+            "clip_count": 1,
+            "total_delivered_frames": int(delivered_frames),
+            "segments": [],
+        }
+        return super().decode_and_assemble(
+            manifest, final_latent, video_vae, audio_vae,
+            delivered_frames, window_frames, filename, save_output,
+            previews=previews, unique_id=unique_id,
+        )
 
 
 class SimpleH3FinalWindowPreviewAssemble:
@@ -3256,10 +3561,10 @@ class SimpleH3FinalWindowPreviewAssemble:
     OUTPUT_NODE = True
     CATEGORY = "MiniMax H3/Simple Chain/Upscale"
     DESCRIPTION = (
-        "Writes the refined result in small sequential MP4 windows internally, joins "
-        "them into one final MP4, and publishes only that complete final video. It "
-        "removes temporary previews and base recovery artifacts only after assembly "
-        "when cleanup is enabled."
+        "Writes and publishes the refined result as isolated sequential MP4 windows, "
+        "joins them into one final MP4, then replaces the last window with that complete "
+        "video. It removes temporary previews and base recovery artifacts only after "
+        "assembly when cleanup is enabled."
     )
 
     @classmethod
@@ -3308,6 +3613,7 @@ class SimpleH3FinalWindowPreviewAssemble:
             raise RuntimeError("Refined Window Preview + Assemble requires ffmpeg.")
 
         window_paths = []
+        expected_windows = int(math.ceil(frames / float(int(window_frames))))
         concat_path = os.path.join(preview_dir, f".{transaction}.concat.txt")
         video_tmp = os.path.join(final_dir, f".{transaction}.video.mp4")
         wav_tmp = os.path.join(final_dir, f".{transaction}.wav")
@@ -3344,6 +3650,9 @@ class SimpleH3FinalWindowPreviewAssemble:
                 _chain._safe_unlink(silent_path)
                 _chain._safe_unlink(window_wav)
                 window_paths.append(path)
+                _publish_refined_window_preview(
+                    unique_id, transaction, index, expected_windows, path, True,
+                )
             with open(concat_path, "w", encoding="utf-8") as handle:
                 for path in window_paths:
                     escaped = path.replace("\\", "\\\\").replace("'", "'\\''")
@@ -3431,6 +3740,8 @@ NODE_CLASS_MAPPINGS = {
     "SimpleH3FinalTimelineTrim": SimpleH3FinalTimelineTrim,
     "SimpleH3FinalWindowedRefineAdvanced": SimpleH3FinalWindowedRefineAdvanced,
     "SimpleH3FinalLatentWindowDecodeAssemble": SimpleH3FinalLatentWindowDecodeAssemble,
+    "SimpleH3I2VFinalLatentUpscale": SimpleH3I2VFinalLatentUpscale,
+    "SimpleH3I2VFinalDecodeAssemble": SimpleH3I2VFinalDecodeAssemble,
     "SimpleH3FinalWindowPreviewAssemble": SimpleH3FinalWindowPreviewAssemble,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
@@ -3470,6 +3781,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3FinalTimelineTrim": "Simple H3 Final Timeline Trim",
     "SimpleH3FinalWindowedRefineAdvanced": "Simple H3 Final Latent Refine — Windowed Advanced (Experimental)",
     "SimpleH3FinalLatentWindowDecodeAssemble": "Simple H3 Final Latent — Window Decode + Assemble",
+    "SimpleH3I2VFinalLatentUpscale": "Simple H3 I2V Final Latent Upscale — Optional",
+    "SimpleH3I2VFinalDecodeAssemble": "Simple H3 I2V Final — Window Decode + Save",
     "SimpleH3FinalWindowPreviewAssemble": "Simple H3 Refined Final Preview + Assemble",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",

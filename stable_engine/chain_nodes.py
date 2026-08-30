@@ -2688,7 +2688,11 @@ def _review_video(plan: dict[str, Any], segment: dict[str, Any],
             "filename": os.path.basename(relative_source),
             "subfolder": os.path.dirname(relative_source),
             "type": "output",
-        }, False, "No audio is connected; this review is silent.")
+        }, bool(segment.get("embedded_audio")), (
+            "Using the accumulated preview's embedded audio."
+            if segment.get("embedded_audio") else
+            "No audio is connected; this review is silent."
+        ))
 
     expected_frames = int(segment["delivered_frames"])
     # Review playback is a convenience and must not reject an otherwise valid

@@ -107,14 +107,20 @@ function showReview(data) {
     if (!node._simpleH3Mounted) mount(node);
     const isNewReview = node._simpleH3Review?.token !== data.token;
     node._simpleH3Review = data;
-    node._simpleH3Title.textContent = `Scene ${data.clip_index}/${data.clip_count} — ${data.shot_id}`;
+    node._simpleH3Title.textContent = data.preview_kind === "refined_window"
+        ? `Refined window ${data.clip_index}/${data.clip_count}`
+        : nodeType(node) === "SimpleH3BasePreview"
+            ? `Accumulated base preview — scene ${data.clip_index}/${data.clip_count}`
+            : `Scene ${data.clip_index}/${data.clip_count} — ${data.shot_id}`;
     // Polling must never erase edits the user is preparing for Edit + Retry.
     if (isNewReview) {
         node._simpleH3Prompt.value = data.scene_prompt ?? "";
         node._simpleH3Seed.value = String(data.seed ?? "0");
     }
     node._simpleH3Status.textContent = data.warning || "Ready for review.";
-    node._simpleH3Badge.textContent = data.has_audio ? "video + audio" : "video";
+    node._simpleH3Badge.textContent = data.preview_kind === "refined_window"
+        ? (data.has_audio ? "refined window + audio" : "refined window")
+        : (data.has_audio ? "video + audio" : "video");
     loadMedia(node, data.video, `${data.token}:${data.preview_revision ?? 0}`);
     if (isNewReview) setBusy(node, Boolean(data.auto_continue));
 }
@@ -260,8 +266,8 @@ function mount(node) {
             "SimpleH3FinalWindowPreviewAssemble",
             "SimpleH3FinalLatentWindowDecodeAssemble",
         ].includes(nodeType(node))
-            ? "Waiting for the complete refined video"
-            : "Waiting for a generated scene";
+            ? "Waiting for a refined window"
+            : "Waiting for the accumulated base preview";
     }
 
     const status = style(document.createElement("div"), {
@@ -271,9 +277,9 @@ function mount(node) {
         "SimpleH3FinalWindowPreviewAssemble",
         "SimpleH3FinalLatentWindowDecodeAssemble",
     ].includes(nodeType(node))
-        ? "The player will show only the complete assembled refined video."
+        ? "Each refined window appears here; the complete video replaces the last one."
         : automatic
-            ? "Automatic preview: each item appears here and the final video replaces it."
+            ? "The accumulated base video grows scene by scene; the final replaces it."
             : "The player will receive each saved scene automatically.";
 
     root.append(header, video, prompt, seedRow, actions, status);
