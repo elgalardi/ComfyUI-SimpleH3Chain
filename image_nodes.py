@@ -5,6 +5,7 @@ ComfyUI's native MiniMax H3 implementation.
 """
 
 import math
+import re
 
 import torch
 import torch.nn.functional as F
@@ -49,7 +50,7 @@ class SimpleH3ImagePrepare:
                 "vae": ("VAE",),
                 "reference_image_1": ("IMAGE",),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True, "forceInput": True}),
-                "width": ("INT", {"default": 1344, "min": 256, "max": 4096, "step": 32}),
+                "width": ("INT", {"default": 1344, "min": 256, "max": 16384, "step": 32}),
                 "height": ("INT", {"default": 768, "min": 256, "max": 4096, "step": 32}),
                 "identity_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "reference_resolution": (["match_output_area", "maximum_identity_2048"], {"default": "match_output_area"}),
@@ -146,10 +147,18 @@ class SimpleH3FL2VAStoryboardPrepare:
                         "the reference layout into the generated scene."
                     ),
                 }),
+                "exact_dimensions": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Use the supplied width and height exactly. Recommended for "
+                        "horizontal storyboard strips whose panel geometry is already calculated."
+                    ),
+                }),
             },
             "optional": {
                 "reference_image_2": ("IMAGE",),
                 "reference_image_3": ("IMAGE",),
+                "reference_image_4": ("IMAGE",),
             },
         }
 
@@ -159,41 +168,62 @@ class SimpleH3FL2VAStoryboardPrepare:
     CATEGORY = CATEGORY
 
     def prepare(self, clip, vae, reference_image_1, prompt, width, height,
-                megapixels, candidate_frames, reference_image_2=None, reference_image_3=None):
+                megapixels, candidate_frames, exact_dimensions=True,
+                reference_image_2=None, reference_image_3=None,
+                reference_image_4=None):
         requested_width = max(1, int(width))
         requested_height = max(1, int(height))
         ratio = requested_width / requested_height
-        target_area = max(0.25, float(megapixels)) * 1024.0 * 1024.0
-        width = max(32, round(math.sqrt(target_area * ratio) / 32) * 32)
-        height = max(32, round(math.sqrt(target_area / ratio) / 32) * 32)
-        references = [x for x in (reference_image_1, reference_image_2, reference_image_3) if x is not None]
-        board = _reference_board(references, width, height)
-        labels = ", ".join(f"reference image {i} depicts subject S{i}" for i in range(1, len(references) + 1))
-        final_prompt = (
-            "Generate a completely new single finished cinematic scene image from noise. The connected images are "
-            f"identity references only: {labels}. Use them only for each subject's recognizable face, hair, skin, "
-            "body proportions, and other identity-defining traits. Do not copy their composition, pose, crop, "
-            "background, lighting, camera angle, borders, spacing, or image layout. Do not reproduce a reference "
-            "sheet, montage, collage, split screen, before-and-after image, duplicate person, or separate panel. "
-            "The storyboard description below is the sole authority for wardrobe, action, environment, framing, "
-            "lens, lighting, character placement, and final composition. Produce one unified full-frame scene with "
-            "coherent anatomy, sharp faces, detailed hands, and no captions or labels.\n\n" + str(prompt).strip()
-        )
+        if bool(exact_dimensions):
+            width = max(32, round(requested_width / 32) * 32)
+            height = max(32, round(requested_height / 32) * 32)
+        else:
+            target_area = max(0.25, float(megapixels)) * 1024.0 * 1024.0
+            width = max(32, round(math.sqrt(target_area * ratio) / 32) * 32)
+            height = max(32, round(math.sqrt(target_area / ratio) / 32) * 32)
+        # Picture 1 is the actual source storyboard. It is encoded as a protected
+        # frame-zero keyframe, so pass 2 begins from that exact grid rather than
+        # treating it as another loose identity reference.
+        board = _resize(reference_image_1[:1, ..., :3], width, height, "disabled")
+        identity_references = [
+            x for x in (reference_image_2, reference_image_3, reference_image_4)
+            if x is not None
+        ]
+        final_prompt = str(prompt).strip()
         frames = int(candidate_frames)
         latent, natural_frames = _empty_av_latent(width, height, frames)
         latent["h3_context_frames"] = natural_frames
         latent["h3_requested_frames"] = natural_frames
-        # Supply every identity separately to Qwen's vision encoder. Crucially,
-        # none is VAE-encoded as a keyframe: the diffusion canvas starts from
-        # noise, so the source layout cannot be geometrically preserved.
-        vision_references = [image[:1, ..., :3] for image in references]
-        tokens = clip.tokenize(final_prompt, images=vision_references)
+        ref_items = [{"type": "image", "data": board}]
+        ref_blocks = []
+        for image in identity_references:
+            h, w = int(image.shape[1]), int(image.shape[2])
+            scale = min(1.0, math.sqrt((width * height) / max(1, w * h)))
+            tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            resized = _resize(image[:1, ..., :3], tw, th, "disabled")
+            ref_items.append({"type": "image", "data": resized})
+            ref_blocks.append({
+                "kind": "image", "latent_h": th // 16, "latent_w": tw // 16,
+                "latent": vae.encode(resized),
+            })
+        tokens = clip.tokenize(final_prompt, minimax_ref_items=ref_items)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
+        conditioning = node_helpers.conditioning_set_values(conditioning, {
+            "minimax_keyframes": [{
+                "resolved_frame_index": 0,
+                "latent": vae.encode(board),
+                "motion_context_index": 0,
+            }],
+            "minimax_refs": ref_blocks,
+        })
         return (
             conditioning, latent, board, final_prompt,
-            f"FL2VA vision-only storyboard generation · {len(references)} separate identity references · ratio source "
-            f"{requested_width}x{requested_height} · {float(megapixels):g} MP -> {width}x{height} "
-            f"(multiple of 32) · {natural_frames} candidates · no reference keyframe anchor",
+            f"FL2VA anchored storyboard edit · Picture 1 protected as frame-zero source · "
+            f"{len(identity_references)} additional identity references · ratio source "
+            f"{requested_width}x{requested_height} · "
+            f"{'exact dimensions' if exact_dimensions else f'{float(megapixels):g} MP'} -> {width}x{height} "
+            f"(multiple of 32) · {natural_frames} candidates",
         )
 
 
@@ -232,16 +262,26 @@ class SimpleH3ImageBatchPrepare:
         width = max(32, round(int(width) / 32) * 32)
         height = max(32, round(int(height) / 32) * 32)
         batch_count = max(1, min(4, int(batch_count)))
-        references = [
-            image for image in (
+        indexed_references = [
+            (index, image) for index, image in enumerate((
                 reference_image_1, reference_image_2,
                 reference_image_3, reference_image_4,
-            ) if image is not None
+            ), 1) if image is not None
         ]
+        requested_subjects = {
+            int(value) for value in re.findall(
+                r"(?:<Picture\s+|\bS)([1-4])(?:>|\b)", str(prompt), re.IGNORECASE
+            )
+        }
+        active_references = (
+            [(index, image) for index, image in indexed_references if index in requested_subjects]
+            if requested_subjects else indexed_references
+        )
+        references = [image for _, image in active_references]
         if references:
             labels = ", ".join(
-                f"<Picture {index}> is identity reference S{index}"
-                for index in range(1, len(references) + 1)
+                f"vision reference {position} depicts S{subject_index}"
+                for position, (subject_index, _image) in enumerate(active_references, 1)
             )
             reference_rule = (
                 f"Connected identity references: {labels}. Preserve recognizable identity "
@@ -271,7 +311,7 @@ class SimpleH3ImageBatchPrepare:
             conditioning,
             latent,
             final_prompt,
-            f"H3 independent image batch · {batch_count} outputs · {len(references)} refs · "
+            f"H3 independent image batch · {batch_count} outputs · {len(references)} scene-selected refs · "
             f"{width}x{height} · {natural_frames} candidates per output",
         )
 
@@ -323,6 +363,38 @@ class SimpleH3ImageSampling:
         sampler = comfy.samplers.sampler_object(sampler_name)
         sigmas = comfy.samplers.calculate_sigmas(sampling, "simple", steps).cpu()
         return patched, sampler, sigmas, f"{profile} · shifts {shift_video:g}/{shift_audio:g}"
+
+
+class SimpleH3ImageSamplingDenoise(SimpleH3ImageSampling):
+    """Image sampler with an explicit partial-schedule control for experiments."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        inputs["required"]["denoise"] = ("FLOAT", {
+            "default": 1.0, "min": 0.05, "max": 1.0, "step": 0.05,
+            "tooltip": (
+                "1.0 runs the complete H3 image schedule and is recommended. Lower values "
+                "run only the final part of the schedule; this is not true img2img because "
+                "the storyboard reference is supplied through vision conditioning."
+            ),
+        })
+        return inputs
+
+    def build(self, model, profile, shift_video, shift_audio, denoise):
+        patched, sampler, _sigmas, _info = super().build(
+            model, profile, shift_video, shift_audio
+        )
+        sampler_name, steps = self.PROFILES[profile]
+        sampling = patched.get_model_object("model_sampling")
+        denoise = max(0.05, min(1.0, float(denoise)))
+        total_steps = steps if denoise >= 0.999 else max(steps, int(steps / denoise))
+        sigmas = comfy.samplers.calculate_sigmas(sampling, "simple", total_steps).cpu()
+        sigmas = sigmas[-(steps + 1):]
+        return (
+            patched, sampler, sigmas,
+            f"{profile} · denoise {denoise:g} · shifts {shift_video:g}/{shift_audio:g}",
+        )
 
 
 class SimpleH3ImageDecode:
@@ -436,6 +508,7 @@ NODE_CLASS_MAPPINGS = {
     "SimpleH3FL2VAStoryboardPrepare": SimpleH3FL2VAStoryboardPrepare,
     "SimpleH3ImageBatchPrepare": SimpleH3ImageBatchPrepare,
     "SimpleH3ImageSampling": SimpleH3ImageSampling,
+    "SimpleH3ImageSamplingDenoise": SimpleH3ImageSamplingDenoise,
     "SimpleH3ImageDecode": SimpleH3ImageDecode,
     "SimpleH3ImageSelect": SimpleH3ImageSelect,
 }
@@ -445,6 +518,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3FL2VAStoryboardPrepare": "Simple H3 FL2VA Storyboard Image Prepare",
     "SimpleH3ImageBatchPrepare": "Simple H3 Image Batch Prepare (1–4)",
     "SimpleH3ImageSampling": "Simple H3 Image Sampling",
+    "SimpleH3ImageSamplingDenoise": "Simple H3 Image Sampling — Denoise (Experimental)",
     "SimpleH3ImageDecode": "Simple H3 Image Decode",
     "SimpleH3ImageSelect": "Simple H3 Best Image",
 }

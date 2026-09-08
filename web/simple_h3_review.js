@@ -1,7 +1,13 @@
 import {app} from "/scripts/app.js";
 import {api} from "/scripts/api.js";
 
-const NODE_NAME = "SimpleH3ChainReview";
+const NODE_NAMES = new Set([
+    "SimpleH3ChainReview",
+    "SimpleH3BasePreview",
+    "SimpleH3DirectEditPreview",
+    "SimpleH3FinalWindowPreviewAssemble",
+    "SimpleH3FinalLatentWindowDecodeAssemble",
+]);
 const mounted = new Set();
 let pollTimer = null;
 
@@ -15,10 +21,10 @@ function nodes() {
 
 function findNode(data) {
     const exact = app.graph?.getNodeById?.(data?.node_id);
-    if (nodeType(exact) === NODE_NAME) return exact;
+    if (NODE_NAMES.has(nodeType(exact))) return exact;
     const execution = app.graph?.getNodeById?.(data?.execution_id);
-    if (nodeType(execution) === NODE_NAME) return execution;
-    return nodes().find((node) => nodeType(node) === NODE_NAME) ?? null;
+    if (NODE_NAMES.has(nodeType(execution))) return execution;
+    return nodes().find((node) => NODE_NAMES.has(nodeType(node))) ?? null;
 }
 
 function mediaKey(item, revision = "") {
@@ -102,14 +108,20 @@ function showReview(data) {
     if (!node._simpleH3Mounted) mount(node);
     const isNewReview = node._simpleH3Review?.token !== data.token;
     node._simpleH3Review = data;
-    node._simpleH3Title.textContent = `Scene ${data.clip_index}/${data.clip_count} — ${data.shot_id}`;
+    node._simpleH3Title.textContent = data.preview_kind === "refined_window"
+        ? `Refined window ${data.clip_index}/${data.clip_count}`
+        : nodeType(node) === "SimpleH3BasePreview"
+            ? `Accumulated base preview — scene ${data.clip_index}/${data.clip_count}`
+            : `Scene ${data.clip_index}/${data.clip_count} — ${data.shot_id}`;
     // Polling must never erase edits the user is preparing for Edit + Retry.
     if (isNewReview) {
         node._simpleH3Prompt.value = data.scene_prompt ?? "";
         node._simpleH3Seed.value = String(data.seed ?? "0");
     }
     node._simpleH3Status.textContent = data.warning || "Ready for review.";
-    node._simpleH3Badge.textContent = data.has_audio ? "video + audio" : "video";
+    node._simpleH3Badge.textContent = data.preview_kind === "refined_window"
+        ? (data.has_audio ? "refined window + audio" : "refined window")
+        : (data.has_audio ? "video + audio" : "video");
     loadMedia(node, data.video, `${data.token}:${data.preview_revision ?? 0}`);
     if (isNewReview) setBusy(node, Boolean(data.auto_continue));
 }
@@ -126,6 +138,38 @@ function resolveReview(data) {
     }
     node._simpleH3Status.textContent = data.status ?? "Review resolved.";
     setBusy(node, true);
+}
+
+function showExecutionOutput(data) {
+    const nodeId = data?.node ?? data?.node_id ?? data?.execution_id;
+    const node = app.graph?.getNodeById?.(nodeId);
+    if (!node || !NODE_NAMES.has(nodeType(node))) return;
+    if (!node._simpleH3Mounted) mount(node);
+
+    const output = data?.output ?? data ?? {};
+    const videos = output.videos ?? output.gifs ?? [];
+    const item = videos.at?.(-1) ?? videos[videos.length - 1];
+    if (!item?.filename) return;
+
+    // `executed` is emitted once the transactionally assembled file exists.
+    // A fresh revision guarantees that a repeated filename is reloaded.
+    loadMedia(
+        node,
+        item,
+        `executed:${data?.prompt_id ?? ""}:${Date.now()}`,
+    );
+    const isFinal = [
+        "SimpleH3FinalWindowPreviewAssemble",
+        "SimpleH3FinalLatentWindowDecodeAssemble",
+    ].includes(nodeType(node));
+    node._simpleH3Title.textContent = isFinal
+        ? "Refined final video"
+        : "Generated preview";
+    node._simpleH3Badge.textContent = isFinal
+        ? "final assembled video"
+        : "video preview";
+    const text = Array.isArray(output.text) ? output.text.join("\n") : output.text;
+    node._simpleH3Status.textContent = text || "Video ready.";
 }
 
 async function fetchPending() {
@@ -214,10 +258,34 @@ function mount(node) {
     stop.style.background = "#64333d";
     actions.append(approve, retry, reroll, stop);
 
+    const automatic = nodeType(node) !== "SimpleH3ChainReview";
+    if (automatic) {
+        prompt.style.display = "none";
+        seedRow.style.display = "none";
+        actions.style.display = "none";
+        title.textContent = [
+            "SimpleH3FinalWindowPreviewAssemble",
+            "SimpleH3FinalLatentWindowDecodeAssemble",
+        ].includes(nodeType(node))
+            ? "Waiting for a refined window"
+            : nodeType(node) === "SimpleH3DirectEditPreview"
+                ? "Waiting for one-pass edit preview"
+                : "Waiting for the accumulated base preview";
+    }
+
     const status = style(document.createElement("div"), {
         minHeight: "20px", color: "#aeb7c8", whiteSpace: "pre-wrap",
     });
-    status.textContent = "The player will receive each saved scene automatically.";
+    status.textContent = [
+        "SimpleH3FinalWindowPreviewAssemble",
+        "SimpleH3FinalLatentWindowDecodeAssemble",
+    ].includes(nodeType(node))
+        ? "Each refined window appears here; the complete video replaces the last one."
+        : nodeType(node) === "SimpleH3DirectEditPreview"
+            ? "The complete one-pass H3 edit appears here with its original source audio."
+        : automatic
+            ? "The accumulated base video grows scene by scene; the final replaces it."
+            : "The player will receive each saved scene automatically.";
 
     root.append(header, video, prompt, seedRow, actions, status);
     const widget = node.addDOMWidget("simple_h3_review", "simple-h3-review", root, {
@@ -247,12 +315,13 @@ function mount(node) {
 
 api.addEventListener("simple_h3_chain_review", (event) => showReview(event.detail));
 api.addEventListener("simple_h3_chain_review_resolved", (event) => resolveReview(event.detail));
+api.addEventListener("executed", (event) => showExecutionOutput(event.detail));
 api.addEventListener("status", fetchPending);
 
 app.registerExtension({
     name: "simple_h3_chain.review",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_NAME) return;
+        if (!NODE_NAMES.has(nodeData.name)) return;
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = created?.apply(this, arguments);
@@ -261,10 +330,10 @@ app.registerExtension({
         };
     },
     async nodeCreated(node) {
-        if (nodeType(node) === NODE_NAME) mount(node);
+        if (NODE_NAMES.has(nodeType(node))) mount(node);
     },
     async afterConfigureGraph() {
-        for (const node of nodes()) if (nodeType(node) === NODE_NAME) mount(node);
+        for (const node of nodes()) if (NODE_NAMES.has(nodeType(node))) mount(node);
         await fetchPending();
     },
 });

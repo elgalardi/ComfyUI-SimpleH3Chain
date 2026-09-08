@@ -131,6 +131,17 @@ def _prompt_text(value: Any, label: str) -> str:
     return str(value or "").strip()
 
 
+def _h3_frame_length_at_least(requested: int) -> int:
+    """Return the first valid 17k+5 H3 length at or above a frame count."""
+    requested = max(5, int(requested))
+    length = requested + (5 - requested % 17) % 17
+    if length > MAX_H3_FRAMES:
+        raise ValueError(
+            "H3 requires at least %d frames after context compensation; the largest "
+            "valid 17k+5 length is %d frames." % (requested, MAX_H3_FRAMES))
+    return length
+
+
 def _h3_frame_length(seconds: float) -> int:
     """Round a duration up to H3's valid 17k+5 frame grid."""
     seconds = float(seconds)
@@ -139,13 +150,14 @@ def _h3_frame_length(seconds: float) -> int:
     # Subtract a tiny tolerance so an exactly frame-aligned decimal does not
     # jump a frame because of binary floating-point representation.
     requested = max(5, int(math.ceil(seconds * FPS - 1e-9)))
-    length = requested + (5 - requested % 17) % 17
-    if length > MAX_H3_FRAMES:
+    try:
+        return _h3_frame_length_at_least(requested)
+    except ValueError:
         raise ValueError(
             "H3 shot duration %.6fs rounds to %d frames; the largest valid "
             "17k+5 length is %d frames (%.6fs)." %
-            (seconds, length, MAX_H3_FRAMES, MAX_H3_FRAMES / float(FPS)))
-    return length
+            (seconds, requested + (5 - requested % 17) % 17,
+             MAX_H3_FRAMES, MAX_H3_FRAMES / float(FPS)))
 
 
 def _validate_h3_length(length: Any, label: str) -> int:
@@ -465,21 +477,38 @@ def _plan_with_external_context(
     anchor_mode = prepared["compatibility"]["anchor_mode"]
     for offset, shot in enumerate(prepared["shots"]):
         raw_frames = int(shot["raw_frames"])
+        duration_based = bool(shot.get("duration_based", False))
+        duration_compensated = bool(
+            shot.get("duration_compensated", duration_based)
+        )
+        requested_delivered = int(
+            shot.get("requested_delivered_frames", raw_frames)
+        )
         if offset == 0:
             if anchor_mode == "head":
-                if raw_frames <= span:
+                if duration_compensated:
+                    raw_frames = _h3_frame_length_at_least(
+                        requested_delivered + span
+                    )
+                    shot["raw_frames"] = raw_frames
+                    delivered_frames = requested_delivered
+                elif raw_frames <= span:
                     raise ValueError(
                         "H3 scene 1 has %d raw frames, not enough for the "
                         "%d-frame imported-video overlap." % (raw_frames, span))
+                else:
+                    delivered_frames = raw_frames - span
                 generation_start = -span
-                delivered_frames = raw_frames - span
             else:
                 generation_start = 0
                 delivered_frames = raw_frames
             shot["external_context_frames"] = span
         elif anchor_mode == "head":
             generation_start = stitched_frames - configured
-            delivered_frames = raw_frames - configured
+            delivered_frames = (
+                requested_delivered if duration_compensated
+                else raw_frames - configured
+            )
         else:
             generation_start = stitched_frames
             delivered_frames = raw_frames
@@ -661,6 +690,8 @@ def _normalize_plan(
     base_seed: int,
     segment_crf: int,
     generation_fingerprint: str = "",
+    preserve_delivered_duration: bool = True,
+    compensate_final_overlap_loss: bool = False,
 ) -> dict[str, Any]:
     try:
         raw = json.loads(str(plan_json or ""))
@@ -735,15 +766,18 @@ def _normalize_plan(
             part for part in (prompt_prefix, scene_prompt) if part)
 
         explicit_length = item.get("length", item.get("frames"))
+        duration_based = explicit_length is None
         if explicit_length is None:
             duration = float(item.get("duration_seconds", default_duration))
             if not math.isfinite(duration) or duration <= 0:
                 raise ValueError(
                     "Shot %d duration must be a finite positive number." % index)
-            raw_frames = _h3_frame_length(duration)
+            requested_delivered_frames = _h3_frame_length(duration)
+            raw_frames = requested_delivered_frames
         else:
             raw_frames = _validate_h3_length(explicit_length,
                                                    "Shot %d length" % index)
+            requested_delivered_frames = raw_frames
 
         if index == 1:
             generation_start_frame = 0
@@ -755,12 +789,36 @@ def _normalize_plan(
                     "continuation overlap." % (index, raw_frames, context_length))
             if anchor_mode == "head":
                 generation_start_frame = stitched_frames - context_length
-                delivered_frames = raw_frames - context_length
+                if duration_based and preserve_delivered_duration:
+                    # A duration is a user-facing delivered duration. Generate
+                    # enough valid H3 frames to carry the repeated context, then
+                    # trim both the overlap and any 17k+5 grid padding.
+                    raw_frames = _h3_frame_length_at_least(
+                        requested_delivered_frames + context_length)
+                    delivered_frames = requested_delivered_frames
+                else:
+                    # Explicit frame lengths retain their historical meaning as
+                    # raw sampler lengths for backwards compatibility.
+                    delivered_frames = raw_frames - context_length
             else:
                 # `before` places context at negative coordinates, so no
                 # repeated head is delivered or trimmed from the new clip.
                 generation_start_frame = stitched_frames
                 delivered_frames = raw_frames
+
+        # Specialized source-timeline plans may generate the next valid H3
+        # length and explicitly discard only its grid-padding tail. This keeps
+        # exact source timing without pretending those padding frames are a
+        # continuation overlap.
+        explicit_delivered = item.get("delivered_frames")
+        if explicit_delivered is not None:
+            explicit_delivered = int(explicit_delivered)
+            if explicit_delivered < 1 or explicit_delivered > raw_frames:
+                raise ValueError(
+                    "Shot %d delivered_frames must be between 1 and raw length %d." %
+                    (index, raw_frames))
+            delivered_frames = explicit_delivered
+            requested_delivered_frames = explicit_delivered
 
         steps = int(item.get("steps", default_steps))
         if steps < 1 or steps > 10000:
@@ -783,12 +841,49 @@ def _normalize_plan(
             "steps": steps,
             "raw_frames": raw_frames,
             "delivered_frames": delivered_frames,
+            "requested_delivered_frames": requested_delivered_frames,
+            "duration_based": duration_based,
+            "duration_compensated": bool(
+                duration_based and preserve_delivered_duration
+            ),
             "generation_start_frame": generation_start_frame,
-            "audio_start_seconds": generation_start_frame / float(FPS),
-            "audio_duration_seconds": raw_frames / float(FPS),
+            "audio_start_seconds": int(
+                item.get("audio_start_frame", generation_start_frame)
+            ) / float(FPS),
+            # An explicitly shorter delivered window means the remaining raw
+            # frames are H3-grid tail padding, not source-timeline content.
+            # Source audio must follow the delivered clock or the final block
+            # would incorrectly request samples beyond the source duration.
+            "audio_duration_seconds": (
+                delivered_frames if explicit_delivered is not None else raw_frames
+            ) / float(FPS),
         }
         shots.append(shot)
         stitched_frames += delivered_frames
+
+    if bool(compensate_final_overlap_loss) and len(shots) > 1:
+        # Masked AV intentionally treats each requested H3 length as a raw
+        # sampler length, so every continuation contributes context_length
+        # fewer delivered frames. Recover the complete requested timeline only
+        # in the final continuation. Extending the first reference-anchored shot
+        # changes the first seam's timing and makes scene 1 -> 2 behave
+        # differently from every later masked overlap. Keeping all earlier
+        # shots untouched preserves one identical seam contract throughout.
+        recovered_frames = (len(shots) - 1) * context_length
+
+        last = shots[-1]
+        desired_delivered = int(last["delivered_frames"]) + recovered_frames
+        compensated_raw = _h3_frame_length_at_least(
+            desired_delivered + context_length
+        )
+        tail_padding = compensated_raw - desired_delivered - context_length
+        last["raw_frames"] = compensated_raw
+        last["delivered_frames"] = desired_delivered
+        last["audio_duration_seconds"] = compensated_raw / float(FPS)
+        last["duration_compensated"] = True
+        last["masked_time_recovery_frames"] = recovered_frames
+        last["tail_padding_frames"] = tail_padding
+        stitched_frames += recovered_frames
 
     for shot in shots[:-1]:
         if shot["delivered_frames"] < context_length:
@@ -818,6 +913,7 @@ def _normalize_plan(
     plan = {
         "version": PLAN_VERSION,
         "run_name": _safe_name(run_name, "h3_chain"),
+        "director_mode": str(raw.get("director_mode") or "Continuous Story"),
         "prompt_prefix": prompt_prefix,
         "shots": shots,
         "compatibility": compatibility,
@@ -825,6 +921,7 @@ def _normalize_plan(
         "total_delivered_frames": stitched_frames,
     }
     plan["plan_hash"] = _fingerprint({
+        "director_mode": plan["director_mode"],
         "compatibility": compatibility,
         "shots": [{k: v for k, v in shot.items()
                    if k not in ("prompt", "scene_prompt")}
@@ -844,8 +941,8 @@ def _output_root() -> str:
 
 def _run_dir(plan: dict[str, Any]) -> str:
     root = _output_root()
-    path = os.path.abspath(os.path.join(root, "h3_chains", plan["run_name"]))
-    if os.path.commonpath([root, path]) != root:
+    path = os.path.abspath(os.path.join(root, plan["run_name"]))
+    if os.path.commonpath([root, path]) != root or path == root:
         raise ValueError("H3 chain run path escapes the ComfyUI output directory.")
     return path
 
@@ -887,8 +984,13 @@ def _publish_final_review_preview(
     """Replace the last scene preview with the assembled Simple H3 video."""
     if manifest.get("format") != "h3_chain_manifest_v3":
         return
-    pending = _PENDING_FINAL_REVIEW_PREVIEWS.pop(
-        _final_review_preview_key(manifest), None)
+    # Keep the routing entry available for the duration of the execution.
+    # ComfyUI can evaluate an output assembler once inside the recursive graph
+    # and once again at the top level.  The second evaluation may replace a
+    # temporary MP4, so it must also republish the new path instead of leaving
+    # the player pointing at the first (now removed) file.
+    pending = _PENDING_FINAL_REVIEW_PREVIEWS.get(
+        _final_review_preview_key(manifest))
     if pending is None or PromptServer is None or PromptServer.instance is None:
         return
     payload = {
@@ -912,7 +1014,9 @@ def _artifact_paths(plan: dict[str, Any], index: int) -> dict[str, str]:
     run_dir = _run_dir(plan)
     return {
         "run_dir": run_dir,
-        "segment": os.path.join(run_dir, "segments", "clip_%04d.mp4" % index),
+        "segment": os.path.join(
+            run_dir, "previews", "base", "clip_%04d.mp4" % index
+        ),
         "checkpoint": os.path.join(run_dir, "checkpoints",
                                    "clip_%04d.safetensors" % index),
         "metadata": os.path.join(run_dir, "checkpoints", "clip_%04d.json" % index),
@@ -1199,8 +1303,13 @@ def _verify_segment_artifacts(segment: dict[str, Any], index: int) -> None:
         raise ValueError(
             "H3 chain metadata slot %d points to segment index %r." %
             (index, segment.get("index")))
-    for key, hash_key in (("segment", "segment_sha256"),
-                          ("checkpoint", "checkpoint_sha256")):
+    # A latent-only run intentionally has no encoded scene MP4. The checkpoint
+    # remains mandatory because it is the transactional recovery source and the
+    # input to final windowed upscale/refinement.
+    artifact_pairs = [("checkpoint", "checkpoint_sha256")]
+    if segment.get("segment") or segment.get("segment_sha256"):
+        artifact_pairs.insert(0, ("segment", "segment_sha256"))
+    for key, hash_key in artifact_pairs:
         value = segment.get(key)
         expected_hash = str(segment.get(hash_key) or "")
         if not isinstance(value, str) or not expected_hash:
@@ -1296,6 +1405,11 @@ def _load_resume_state(plan: dict[str, Any], start_clip: int) -> dict[str, Any]:
         "index": start_clip,
         "previous_frames": tensors["context_frames"],
         "previous_latent": {"samples": [tensors["video"], tensors["audio"]]},
+        "previous_refined_latent": (
+            {"samples": [tensors["refined_video"], tensors["refined_audio"]]}
+            if "refined_video" in tensors and "refined_audio" in tensors
+            else None
+        ),
         "segments": segments,
         "resumed_from": previous_index,
     }
@@ -1323,6 +1437,7 @@ def _initial_state(plan: dict[str, Any], start_clip: int,
                 external_context.get("context_frames")
                 if isinstance(external_context, dict) else None),
             "previous_latent": None,
+            "previous_refined_latent": None,
             "previous_audio": (
                 external_context.get("context_audio")
                 if isinstance(external_context, dict) else None),
@@ -1988,7 +2103,9 @@ class MiniMaxH3ChainPlan:
               context_length,
               encode_mode, anchor_mode, crop, audio_mode,
               audio_context_length, default_duration_seconds, default_steps,
-              base_seed, segment_crf, plan_json_input=None):
+              base_seed, segment_crf, plan_json_input=None,
+              _preserve_delivered_duration=True,
+              _compensate_final_overlap_loss=False):
         effective_plan_json = (
             plan_json_input
             if isinstance(plan_json_input, str) and plan_json_input.strip()
@@ -1998,7 +2115,9 @@ class MiniMaxH3ChainPlan:
             effective_plan_json, run_name, width, height, context_length, encode_mode,
             anchor_mode, crop, audio_mode, audio_context_length,
             default_duration_seconds, default_steps, base_seed, segment_crf,
-            generation_fingerprint)
+            generation_fingerprint,
+            preserve_delivered_duration=_preserve_delivered_duration,
+            compensate_final_overlap_loss=_compensate_final_overlap_loss)
         return (plan, plan["summary"], len(plan["shots"]),
                 plan["compatibility"]["width"],
                 plan["compatibility"]["height"])
@@ -2365,6 +2484,31 @@ class MiniMaxH3ChainSegmentSave:
                    "plus a safetensors resume checkpoint, exact prompt metadata, "
                    "and workflow recovery sidecars.")
 
+    @staticmethod
+    def _encode_scene_preview(prompt: Any) -> bool:
+        """Return false only for an explicitly configured latent-only graph."""
+        if not isinstance(prompt, dict):
+            return True
+        preview_flags = []
+        assembly_flags = []
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get("class_type") or "")
+            inputs = node.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                continue
+            if class_type == "SimpleH3BasePreview":
+                preview_flags.append(bool(inputs.get("show_scene_previews", True)))
+            elif class_type == "SimpleH3BasePreviewAssemble":
+                assembly_flags.append(bool(inputs.get("assemble_base_video", True)))
+        # Missing controls preserve the historical safe behavior. Skipping the
+        # MP4 is allowed only when both downstream consumers explicitly opt out.
+        return not (
+            preview_flags and assembly_flags and
+            not any(preview_flags) and not any(assembly_flags)
+        )
+
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("NaN")
@@ -2378,11 +2522,17 @@ class MiniMaxH3ChainSegmentSave:
         shot = plan["shots"][index - 1]
         actual_frames = int(images.shape[0])
         expected_frames = int(shot["delivered_frames"])
-        if actual_frames != expected_frames:
+        base_preview = bool(plan.get("base_preview", True))
+        expected_images = (
+            expected_frames if base_preview else
+            int(plan["compatibility"]["context_length"])
+        )
+        if actual_frames != expected_images:
             raise ValueError(
-                "H3 chain clip %d produced %d delivered frames; expected %d. "
-                "Wire decoded images through MiniMax H3 Contex Loop Trim before "
-                "Segment Save." % (index, actual_frames, expected_frames))
+                "H3 chain clip %d supplied %d decoded frames; expected %d for "
+                "base_preview=%s. Wire the video latent through Simple H3 Base "
+                "Context Decode and Simple H3 Trim." %
+                (index, actual_frames, expected_images, base_preview))
 
         mode = plan["compatibility"]["audio_mode"]
         if mode in ("generated_audio", "source_intro_generated") and audio is None:
@@ -2398,15 +2548,66 @@ class MiniMaxH3ChainSegmentSave:
             "video": parts[0],
             "audio": parts[1],
         }
+        refined_latent = sampled_latent.get("_simple_h3_refined_latent")
+        if isinstance(refined_latent, dict):
+            refined_parts = _compact_latent(refined_latent)["samples"]
+            tensors["refined_video"] = refined_parts[0]
+            tensors["refined_audio"] = refined_parts[1]
         sample_rate = 0
         if audio is not None:
+            if mode == "source_track":
+                source_waveform, source_rate = _validate_audio(
+                    audio, "H3 chain clip %d source audio" % index)
+                wanted_samples = int(round(
+                    expected_frames / float(FPS) * source_rate))
+                if int(source_waveform.shape[-1]) >= wanted_samples:
+                    source_waveform = source_waveform[..., :wanted_samples]
+                else:
+                    source_waveform = F.pad(
+                        source_waveform,
+                        (0, wanted_samples - int(source_waveform.shape[-1])),
+                    )
+                audio = dict(audio)
+                audio["waveform"] = source_waveform.contiguous()
+                audio["sample_rate"] = source_rate
             waveform, sample_rate = _validate_audio(
                 audio, "H3 chain clip %d delivered audio" % index,
                 expected_frames=expected_frames)
             tensors["delivered_audio"] = _tensor_cpu_clone(waveform)
+            fingerprint = str(
+                plan.get("compatibility", {}).get("generation_fingerprint") or ""
+            )
+            if "type=masked_av" in fingerprint:
+                raw_waveform = audio.get("_simple_h3_raw_waveform")
+                raw_audio_frames = int(
+                    audio.get("_simple_h3_raw_frames", shot["raw_frames"])
+                )
+                if raw_waveform is None:
+                    raise ValueError(
+                        "Simple H3 masked_av requires audio from Simple H3 Trim "
+                        "so its protected overlap can be retained."
+                    )
+                if raw_audio_frames != int(shot["raw_frames"]):
+                    raise ValueError(
+                        "Simple H3 masked_av raw audio reports %d frames; expected %d."
+                        % (raw_audio_frames, int(shot["raw_frames"]))
+                    )
+                expected_raw_samples = int(round(
+                    raw_audio_frames / float(FPS) * sample_rate
+                ))
+                if int(raw_waveform.shape[-1]) != expected_raw_samples:
+                    raise ValueError(
+                        "Simple H3 masked_av raw audio has %d samples; expected %d."
+                        % (int(raw_waveform.shape[-1]), expected_raw_samples)
+                    )
+                tensors["masked_raw_audio"] = _tensor_cpu_clone(raw_waveform)
 
         paths = _artifact_paths(plan, index)
-        os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
+        encode_scene_preview = bool(plan.get(
+            "base_preview", self._encode_scene_preview(prompt)
+        ))
+        if encode_scene_preview:
+            os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
         os.makedirs(os.path.dirname(paths["checkpoint"]), exist_ok=True)
         archives = _write_run_archives(plan, prompt, extra_pnginfo)
         previous_metadata = None
@@ -2418,9 +2619,14 @@ class MiniMaxH3ChainSegmentSave:
                              index, exc)
 
         transaction = uuid.uuid4().hex
-        published_segment = _versioned_path(paths["segment"], transaction)
+        published_segment = (
+            _versioned_path(paths["segment"], transaction)
+            if encode_scene_preview else None
+        )
         published_checkpoint = _versioned_path(paths["checkpoint"], transaction)
-        published_prompt = os.path.splitext(published_segment)[0] + ".prompt.txt"
+        published_prompt = os.path.splitext(
+            published_segment or published_checkpoint
+        )[0] + ".prompt.txt"
         checkpoint_tmp = "%s.%s.tmp" % (published_checkpoint, uuid.uuid4().hex)
         committed = False
         try:
@@ -2433,9 +2639,10 @@ class MiniMaxH3ChainSegmentSave:
                 "h3_prompt": shot["prompt"],
                 "h3_seed": str(shot["seed"]),
             })
-            _write_segment_video(
-                images, published_segment, FPS, plan["segment_crf"],
-                metadata=video_metadata)
+            if published_segment is not None:
+                _write_segment_video(
+                    images, published_segment, FPS, plan["segment_crf"],
+                    metadata=video_metadata)
             _atomic_text(published_prompt, shot["prompt"])
             _st_save(tensors, checkpoint_tmp, metadata={
                 "format": "h3_chain_checkpoint_v3",
@@ -2453,7 +2660,6 @@ class MiniMaxH3ChainSegmentSave:
             segment = {
                 "index": index,
                 "id": shot["id"],
-                "segment": _relative_output_path(published_segment),
                 "checkpoint": _relative_output_path(published_checkpoint),
                 "metadata": _relative_output_path(paths["metadata"]),
                 "prompt_file": _relative_output_path(published_prompt),
@@ -2465,10 +2671,12 @@ class MiniMaxH3ChainSegmentSave:
                 "seed": shot["seed"],
                 "steps": shot["steps"],
                 "sample_rate": sample_rate,
-                "segment_sha256": _file_sha256(published_segment),
                 "checkpoint_sha256": _file_sha256(published_checkpoint),
                 "prompt_file_sha256": _file_sha256(published_prompt),
             }
+            if published_segment is not None:
+                segment["segment"] = _relative_output_path(published_segment)
+                segment["segment_sha256"] = _file_sha256(published_segment)
             metadata = {
                 "format": "h3_chain_segment_v3",
                 "run_name": plan["run_name"],
@@ -2485,16 +2693,25 @@ class MiniMaxH3ChainSegmentSave:
         finally:
             _safe_unlink(checkpoint_tmp)
             if not committed:
-                _safe_unlink(published_segment)
+                if published_segment is not None:
+                    _safe_unlink(published_segment)
                 _safe_unlink(published_checkpoint)
                 _safe_unlink(published_prompt)
 
         _cleanup_previous_artifacts(
             plan, index, previous_metadata,
-            {published_segment, published_checkpoint, published_prompt})
-        status = ("saved clip %d/%d: %s + checkpoint %s" %
-                  (index, len(plan["shots"]), published_segment,
-                   published_checkpoint))
+            {value for value in (
+                published_segment, published_checkpoint, published_prompt
+            ) if value})
+        if published_segment is None:
+            status = (
+                "saved latent-only clip %d/%d: checkpoint %s; base MP4 preview disabled"
+                % (index, len(plan["shots"]), published_checkpoint)
+            )
+        else:
+            status = ("saved clip %d/%d: %s + checkpoint %s" %
+                      (index, len(plan["shots"]), published_segment,
+                       published_checkpoint))
         _LOG.info("H3 Chain %s", status)
         return {"ui": {"text": [status]}, "result": (segment, status)}
 
@@ -2508,7 +2725,11 @@ def _review_video(plan: dict[str, Any], segment: dict[str, Any],
             "filename": os.path.basename(relative_source),
             "subfolder": os.path.dirname(relative_source),
             "type": "output",
-        }, False, "No audio is connected; this review is silent.")
+        }, bool(segment.get("embedded_audio")), (
+            "Using the accumulated preview's embedded audio."
+            if segment.get("embedded_audio") else
+            "No audio is connected; this review is silent."
+        ))
 
     expected_frames = int(segment["delivered_frames"])
     # Review playback is a convenience and must not reject an otherwise valid
@@ -3101,7 +3322,21 @@ class MiniMaxH3ChainLoopEnd:
             node = graph.lookup_node(clone_id)
             for key, value in original.get("inputs", {}).items():
                 if is_link(value) and value[0] in contained:
-                    parent = graph.lookup_node(value[0])
+                    # Loop End is deliberately cloned under the reserved
+                    # ``Recurse`` id. Final output nodes (assemblers/previews)
+                    # can legitimately consume its manifest, so their parent
+                    # link must follow that renamed clone instead of looking
+                    # up the original display id and receiving None.
+                    parent_id = (
+                        "Recurse" if str(value[0]) == unique_id else value[0]
+                    )
+                    parent = graph.lookup_node(parent_id)
+                    if parent is None:
+                        raise RuntimeError(
+                            "H3 Chain recursive graph could not resolve parent "
+                            "%s (cloned as %s) for node %s input %s."
+                            % (value[0], parent_id, node_id, key)
+                        )
                     node.set_input(key, parent.out(value[1]))
                 else:
                     node.set_input(key, value)
@@ -3145,6 +3380,11 @@ class MiniMaxH3ChainLoopEnd:
             # clone: a tensor view would retain the entire decoded clip
             "previous_frames": _tensor_cpu_clone(images[-context_length:]),
             "previous_latent": _compact_latent(sampled_latent),
+            "previous_refined_latent": (
+                _compact_latent(sampled_latent["_simple_h3_refined_latent"])
+                if isinstance(sampled_latent.get("_simple_h3_refined_latent"), dict)
+                else None
+            ),
             "segments": list(state.get("segments", [])) +
                         [_public_segment(segment)],
             "resumed_from": state.get("resumed_from", 0),
@@ -3258,8 +3498,113 @@ def _generated_audio(manifest: dict[str, Any]) -> dict[str, Any]:
                 (segment["index"], int(waveform.shape[-1]), expected,
                  int(segment["delivered_frames"])))
         waveforms.append(waveform)
-    return {"waveform": torch.cat(waveforms, dim=-1),
-            "sample_rate": int(sample_rate)}
+    fingerprint = str(
+        manifest.get("compatibility", {}).get("generation_fingerprint") or ""
+    )
+    if "type=masked_av" not in fingerprint:
+        return {"waveform": torch.cat(waveforms, dim=-1),
+                "sample_rate": int(sample_rate)}
+
+    def conform_masked_span(waveform, samples, label):
+        """Time-conform tiny H3 grid differences without adding silence."""
+        samples = int(samples)
+        current = int(waveform.shape[-1])
+        if current == samples:
+            return waveform.detach().cpu().contiguous()
+        fractional = abs(samples - current) / float(max(1, current))
+        if fractional > 0.005:
+            raise ValueError(
+                "%s differs from its frame-derived timeline by %.3f%%."
+                % (label, fractional * 100.0)
+            )
+        channels = int(waveform.shape[1])
+        fitted = torch.nn.functional.interpolate(
+            waveform.to(dtype=torch.float32).reshape(-1, 1, current),
+            size=samples, mode="linear", align_corners=False,
+        ).reshape(1, channels, samples)
+        _LOG.info(
+            "%s time-conformed %d -> %d samples for an exact frame boundary",
+            label, current, samples,
+        )
+        return fitted.detach().cpu().contiguous()
+
+    # Current upstream masked-AV ownership rule: each new extension contains
+    # the protected audio prefix generated with the half-cosine release. Keep
+    # that complete decoded audio and overwrite the matching tail of the
+    # preceding timeline instead of discarding the prefix at Trim.
+    total_frames = int(manifest["total_delivered_frames"])
+    total_samples = int(round(total_frames / float(FPS) * sample_rate))
+    first = manifest["segments"][0]
+    first_checkpoint = _absolute_output_path(first["checkpoint"])
+    first_tensors = _st_load(first_checkpoint)
+    first_wave = first_tensors.get("masked_raw_audio")
+    if first_wave is None:
+        first_wave = first_tensors["delivered_audio"]
+    channels = int(first_wave.shape[1])
+    audio_out = torch.empty(
+        (1, channels, total_samples), dtype=first_wave.dtype, device="cpu"
+    )
+    first_active_frames = int(first["delivered_frames"])
+    first_end = int(round(
+        first_active_frames / float(FPS) * sample_rate
+    ))
+    first_relative_samples = int(round(
+        first_active_frames / float(FPS) * sample_rate
+    ))
+    first_wave = first_wave[..., :first_relative_samples]
+    first_wave = conform_masked_span(
+        first_wave, first_end, "Simple H3 masked_av clip 1 audio"
+    )
+    audio_out[..., :first_end].copy_(first_wave)
+    cumulative_frames = int(first["delivered_frames"])
+
+    for segment in manifest["segments"][1:]:
+        checkpoint = _absolute_output_path(segment["checkpoint"])
+        tensors = _st_load(checkpoint)
+        raw_wave = tensors.get("masked_raw_audio")
+        if raw_wave is None:
+            raise ValueError(
+                "Checkpoint for masked_av clip %d predates overlap-owned audio. "
+                "Regenerate this clip with the current Simple H3 nodes."
+                % int(segment["index"])
+            )
+        overlap_frames = int(
+            manifest.get("compatibility", {}).get("context_length", 39)
+        )
+        tail_padding = max(
+            0,
+            int(segment["raw_frames"])
+            - int(segment["delivered_frames"])
+            - overlap_frames,
+        )
+        active_raw_frames = int(segment["raw_frames"]) - tail_padding
+        start_frame = cumulative_frames - overlap_frames
+        end_frame = start_frame + active_raw_frames
+        start_sample = int(round(start_frame / float(FPS) * sample_rate))
+        end_sample = int(round(end_frame / float(FPS) * sample_rate))
+        expected = end_sample - start_sample
+        relative_active_samples = int(round(
+            active_raw_frames / float(FPS) * sample_rate
+        ))
+        raw_wave = raw_wave[..., :relative_active_samples]
+        raw_wave = conform_masked_span(
+            raw_wave, expected,
+            "Simple H3 masked_av clip %d audio" % int(segment["index"]),
+        )
+        audio_out[..., start_sample:end_sample].copy_(raw_wave)
+        _LOG.info(
+            "Simple H3 masked_av audio: clip %d owns %d-frame protected overlap "
+            "from absolute frame %d; removed %d final H3-grid padding frames",
+            int(segment["index"]), overlap_frames, start_frame, tail_padding,
+        )
+        cumulative_frames = end_frame
+
+    if cumulative_frames != total_frames:
+        raise RuntimeError(
+            "Simple H3 masked_av audio timeline ended at frame %d; expected %d."
+            % (cumulative_frames, total_frames)
+        )
+    return {"waveform": audio_out, "sample_rate": int(sample_rate)}
 
 
 def _validate_prelude(manifest: dict[str, Any]) -> dict[str, Any] | None:
@@ -3616,7 +3961,7 @@ def _new_export_directory(manifest: dict[str, Any], export_name: str) -> str:
     run_name = _safe_name(manifest.get("run_name"), "h3_chain")
     name = _safe_name(export_name, "png_sequence")
     base = os.path.abspath(os.path.join(
-        _output_root(), "h3_chains", run_name, "frames", name))
+        _output_root(), run_name, "frames", name))
     root = _output_root()
     if os.path.commonpath([root, base]) != root:
         raise ValueError("H3 PNG export path escapes the ComfyUI output directory.")
@@ -3670,7 +4015,7 @@ class MiniMaxH3ChainExportPNG:
                                "exactly match the first decode."}),
                 "export_name": ("STRING", {
                     "default": "png_sequence",
-                    "tooltip": "Folder name under output/h3_chains/<run>/frames. "
+                    "tooltip": "Folder name under output/<run>/frames. "
                                "An existing folder is never overwritten; a "
                                "numbered sibling is created automatically."}),
                 "first_frame_number": ("INT", {
@@ -3940,7 +4285,7 @@ class MiniMaxH3ChainAssemble:
             audio = _audio_with_prelude(audio, extension_frames, prelude)
 
         run_name = _safe_name(manifest.get("run_name"), "h3_chain")
-        run_dir = os.path.join(_output_root(), "h3_chains", run_name)
+        run_dir = os.path.join(_output_root(), run_name)
         final_dir = os.path.join(run_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         final_name = _safe_name(filename, "final")
@@ -4160,8 +4505,16 @@ async def _list_saved_checkpoints(request):
     if not run_name:
         return web.json_response(
             {"error": "A non-empty H3 chain run_name is required."}, status=400)
-    checkpoint_dir = os.path.join(
-        _output_root(), "h3_chains", run_name, "checkpoints")
+    run_dir = os.path.join(_output_root(), run_name)
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    # Recovery remains able to read runs made before the direct output layout.
+    # New executions never write through this legacy branch.
+    if not os.path.isdir(checkpoint_dir):
+        legacy_run_dir = os.path.join(_output_root(), "h3_chains", run_name)
+        legacy_checkpoint_dir = os.path.join(legacy_run_dir, "checkpoints")
+        if os.path.isdir(legacy_checkpoint_dir):
+            run_dir = legacy_run_dir
+            checkpoint_dir = legacy_checkpoint_dir
     checkpoints = []
     if os.path.isdir(checkpoint_dir):
         for filename in sorted(os.listdir(checkpoint_dir)):
@@ -4176,20 +4529,23 @@ async def _list_saved_checkpoints(request):
                 index = int(segment.get("index", int(match.group(1))))
                 if index != int(match.group(1)):
                     continue
-                segment_path = _absolute_output_path(segment["segment"])
+                segment_value = segment.get("segment")
+                segment_path = (
+                    _absolute_output_path(segment_value)
+                    if isinstance(segment_value, str) and segment_value else None
+                )
                 checkpoint_path = _absolute_output_path(segment["checkpoint"])
-                ready = (os.path.isfile(segment_path) and
-                         os.path.isfile(checkpoint_path))
+                ready = os.path.isfile(checkpoint_path)
                 item = {
                     "scene": index,
                     "scene_id": str(segment.get("id") or "clip_%04d" % index),
                     "resume_scene": index + 1,
                     "ready": ready,
                 }
-                if os.path.isfile(segment_path):
+                if segment_path and os.path.isfile(segment_path):
                     item["video"] = _video_output_item(segment_path)
                 partial_path = os.path.join(
-                    _output_root(), "h3_chains", run_name, "final",
+                    run_dir, "final",
                     "partial_through_clip_%04d.mp4" % index)
                 if os.path.isfile(partial_path):
                     item["partial_video"] = _video_output_item(partial_path)
@@ -4203,6 +4559,96 @@ async def _list_saved_checkpoints(request):
     })
 
 
+async def _list_studio_gallery(request):
+    """Return persistent Studio outputs independently of ComfyUI history."""
+    output_root = os.path.abspath(_output_root())
+    index_path = os.path.join(output_root, ".sexyai_gallery_index.json")
+    try:
+        with open(index_path, "r", encoding="utf-8") as index_file:
+            gallery_index = json.load(index_file)
+    except (OSError, ValueError, TypeError):
+        gallery_index = {}
+    items = []
+    video_extensions = {".mp4", ".webm", ".mov", ".mkv"}
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+
+    def add_file(file_path, kind):
+        relative = os.path.relpath(file_path, output_root)
+        subfolder = os.path.dirname(relative)
+        key = "%s:%s/%s" % (
+            kind, subfolder.replace("\\", "/"), os.path.basename(file_path))
+        indexed = gallery_index.get(key.lower(), {})
+        items.append({
+            "filename": os.path.basename(file_path),
+            "subfolder": subfolder,
+            "kind": kind,
+            "created_at": os.path.getmtime(file_path),
+            "prompt_id": indexed.get("promptId"),
+            "metadata": indexed.get("metadata"),
+        })
+
+    # Current Simple H3 runs live directly under output/<run_name>/final.
+    # Keep scanning the legacy output/h3_chains tree as well so older gallery
+    # items remain visible after this layout migration.
+    for entry in os.listdir(output_root):
+        run_root = os.path.join(output_root, entry)
+        if not os.path.isdir(run_root):
+            continue
+        candidate_roots = (
+            [os.path.join(run_root, "final")]
+            if entry != "h3_chains" else
+            [os.path.join(run_root, name, "final")
+             for name in os.listdir(run_root)
+             if os.path.isdir(os.path.join(run_root, name))]
+        )
+        for final_root in candidate_roots:
+            if not os.path.isdir(final_root):
+                continue
+            for filename in os.listdir(final_root):
+                file_path = os.path.join(final_root, filename)
+                if (os.path.isfile(file_path) and
+                        os.path.splitext(filename)[1].lower() in video_extensions):
+                    add_file(file_path, "video")
+
+    for folder_name, extensions, kind in (
+            ("SexyAI_Studio", image_extensions, "image"),
+            ("_sexyai_editor", video_extensions, "video")):
+        folder = os.path.join(output_root, folder_name)
+        if not os.path.isdir(folder):
+            continue
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if (os.path.isfile(file_path) and
+                    os.path.splitext(filename)[1].lower() in extensions):
+                add_file(file_path, kind)
+
+    items.sort(key=lambda item: (
+        float(item["created_at"]), item["filename"]), reverse=True)
+    return web.json_response({"results": items[:300]})
+
+
+async def _save_studio_gallery_index(request):
+    """Persist Studio media-to-plan metadata across ComfyUI restarts."""
+    try:
+        payload = await request.json()
+        entries = payload.get("entries")
+        if not isinstance(entries, dict) or len(entries) > 1000:
+            raise ValueError("Invalid gallery index")
+        safe_entries = {
+            str(key).lower(): value for key, value in entries.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+        index_path = os.path.join(
+            os.path.abspath(_output_root()), ".sexyai_gallery_index.json")
+        temporary = index_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as index_file:
+            json.dump(safe_entries, index_file, ensure_ascii=False, indent=2)
+        os.replace(temporary, index_path)
+        return web.json_response({"saved": len(safe_entries)})
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
 if (PromptServer is not None and web is not None and
         getattr(PromptServer, "instance", None) is not None):
     PromptServer.instance.routes.post(
@@ -4211,6 +4657,10 @@ if (PromptServer is not None and web is not None and
         "/simple_h3_chain/reviews")(_list_pending_reviews)
     PromptServer.instance.routes.get(
         "/simple_h3_chain/checkpoints")(_list_saved_checkpoints)
+    PromptServer.instance.routes.get(
+        "/simple_h3_chain/gallery")(_list_studio_gallery)
+    PromptServer.instance.routes.post(
+        "/simple_h3_chain/gallery/index")(_save_studio_gallery_index)
 
 
 CHAIN_NODE_CLASS_MAPPINGS = {
