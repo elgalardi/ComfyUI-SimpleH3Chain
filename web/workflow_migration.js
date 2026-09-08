@@ -8,6 +8,17 @@ const AUDIO_MODES = new Set([
 
 app.registerExtension({
     name: "SimpleH3Chain.workflowMigration",
+    beforeConfigureGraph(graphData) {
+        for (const node of graphData?.nodes ?? []) {
+            if (node.type !== "SimpleH3CompactContinuousPlanJSON") continue;
+            // The former combo serialized seconds as a string, in the same slot.
+            const values = node.widgets_values;
+            if (Array.isArray(values) && typeof values[0] === "string") {
+                const seconds = Number(values[0]);
+                if (Number.isFinite(seconds)) values[0] = seconds;
+            }
+        }
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "SimpleH3ChainPlan") return;
 

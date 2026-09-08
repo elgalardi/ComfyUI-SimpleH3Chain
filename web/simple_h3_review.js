@@ -4,6 +4,7 @@ import {api} from "/scripts/api.js";
 const NODE_NAMES = new Set([
     "SimpleH3ChainReview",
     "SimpleH3BasePreview",
+    "SimpleH3DirectEditPreview",
     "SimpleH3FinalWindowPreviewAssemble",
     "SimpleH3FinalLatentWindowDecodeAssemble",
 ]);
@@ -267,7 +268,9 @@ function mount(node) {
             "SimpleH3FinalLatentWindowDecodeAssemble",
         ].includes(nodeType(node))
             ? "Waiting for a refined window"
-            : "Waiting for the accumulated base preview";
+            : nodeType(node) === "SimpleH3DirectEditPreview"
+                ? "Waiting for one-pass edit preview"
+                : "Waiting for the accumulated base preview";
     }
 
     const status = style(document.createElement("div"), {
@@ -278,6 +281,8 @@ function mount(node) {
         "SimpleH3FinalLatentWindowDecodeAssemble",
     ].includes(nodeType(node))
         ? "Each refined window appears here; the complete video replaces the last one."
+        : nodeType(node) === "SimpleH3DirectEditPreview"
+            ? "The complete one-pass H3 edit appears here with its original source audio."
         : automatic
             ? "The accumulated base video grows scene by scene; the final replaces it."
             : "The player will receive each saved scene automatically.";

@@ -806,6 +806,20 @@ def _normalize_plan(
                 generation_start_frame = stitched_frames
                 delivered_frames = raw_frames
 
+        # Specialized source-timeline plans may generate the next valid H3
+        # length and explicitly discard only its grid-padding tail. This keeps
+        # exact source timing without pretending those padding frames are a
+        # continuation overlap.
+        explicit_delivered = item.get("delivered_frames")
+        if explicit_delivered is not None:
+            explicit_delivered = int(explicit_delivered)
+            if explicit_delivered < 1 or explicit_delivered > raw_frames:
+                raise ValueError(
+                    "Shot %d delivered_frames must be between 1 and raw length %d." %
+                    (index, raw_frames))
+            delivered_frames = explicit_delivered
+            requested_delivered_frames = explicit_delivered
+
         steps = int(item.get("steps", default_steps))
         if steps < 1 or steps > 10000:
             raise ValueError("Shot %d steps must be between 1 and 10000." % index)
@@ -833,8 +847,16 @@ def _normalize_plan(
                 duration_based and preserve_delivered_duration
             ),
             "generation_start_frame": generation_start_frame,
-            "audio_start_seconds": generation_start_frame / float(FPS),
-            "audio_duration_seconds": raw_frames / float(FPS),
+            "audio_start_seconds": int(
+                item.get("audio_start_frame", generation_start_frame)
+            ) / float(FPS),
+            # An explicitly shorter delivered window means the remaining raw
+            # frames are H3-grid tail padding, not source-timeline content.
+            # Source audio must follow the delivered clock or the final block
+            # would incorrectly request samples beyond the source duration.
+            "audio_duration_seconds": (
+                delivered_frames if explicit_delivered is not None else raw_frames
+            ) / float(FPS),
         }
         shots.append(shot)
         stitched_frames += delivered_frames
@@ -2533,6 +2555,21 @@ class MiniMaxH3ChainSegmentSave:
             tensors["refined_audio"] = refined_parts[1]
         sample_rate = 0
         if audio is not None:
+            if mode == "source_track":
+                source_waveform, source_rate = _validate_audio(
+                    audio, "H3 chain clip %d source audio" % index)
+                wanted_samples = int(round(
+                    expected_frames / float(FPS) * source_rate))
+                if int(source_waveform.shape[-1]) >= wanted_samples:
+                    source_waveform = source_waveform[..., :wanted_samples]
+                else:
+                    source_waveform = F.pad(
+                        source_waveform,
+                        (0, wanted_samples - int(source_waveform.shape[-1])),
+                    )
+                audio = dict(audio)
+                audio["waveform"] = source_waveform.contiguous()
+                audio["sample_rate"] = source_rate
             waveform, sample_rate = _validate_audio(
                 audio, "H3 chain clip %d delivered audio" % index,
                 expected_frames=expected_frames)
@@ -2540,7 +2577,7 @@ class MiniMaxH3ChainSegmentSave:
             fingerprint = str(
                 plan.get("compatibility", {}).get("generation_fingerprint") or ""
             )
-            if any(value in fingerprint for value in ("type=masked_av", "type=masked_cut")):
+            if "type=masked_av" in fingerprint:
                 raw_waveform = audio.get("_simple_h3_raw_waveform")
                 raw_audio_frames = int(
                     audio.get("_simple_h3_raw_frames", shot["raw_frames"])
@@ -3464,7 +3501,7 @@ def _generated_audio(manifest: dict[str, Any]) -> dict[str, Any]:
     fingerprint = str(
         manifest.get("compatibility", {}).get("generation_fingerprint") or ""
     )
-    if not any(value in fingerprint for value in ("type=masked_av", "type=masked_cut")):
+    if "type=masked_av" not in fingerprint:
         return {"waveform": torch.cat(waveforms, dim=-1),
                 "sample_rate": int(sample_rate)}
 
