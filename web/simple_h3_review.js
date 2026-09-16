@@ -2,11 +2,7 @@ import {app} from "/scripts/app.js";
 import {api} from "/scripts/api.js";
 
 const NODE_NAMES = new Set([
-    "SimpleH3ChainReview",
-    "SimpleH3BasePreview",
-    "SimpleH3DirectEditPreview",
-    "SimpleH3FinalWindowPreviewAssemble",
-    "SimpleH3FinalLatentWindowDecodeAssemble",
+    "SimpleH3ChainAssemble",
 ]);
 const mounted = new Set();
 let pollTimer = null;
@@ -141,7 +137,7 @@ function resolveReview(data) {
 }
 
 function showExecutionOutput(data) {
-    const nodeId = data?.node ?? data?.node_id ?? data?.execution_id;
+    const nodeId = data?.display_node ?? data?.node ?? data?.node_id ?? data?.execution_id;
     const node = app.graph?.getNodeById?.(nodeId);
     if (!node || !NODE_NAMES.has(nodeType(node))) return;
     if (!node._simpleH3Mounted) mount(node);
@@ -159,11 +155,12 @@ function showExecutionOutput(data) {
         `executed:${data?.prompt_id ?? ""}:${Date.now()}`,
     );
     const isFinal = [
+        "SimpleH3ChainAssemble",
         "SimpleH3FinalWindowPreviewAssemble",
         "SimpleH3FinalLatentWindowDecodeAssemble",
     ].includes(nodeType(node));
     node._simpleH3Title.textContent = isFinal
-        ? "Refined final video"
+        ? "Final video"
         : "Generated preview";
     node._simpleH3Badge.textContent = isFinal
         ? "final assembled video"
@@ -263,7 +260,9 @@ function mount(node) {
         prompt.style.display = "none";
         seedRow.style.display = "none";
         actions.style.display = "none";
-        title.textContent = [
+        title.textContent = nodeType(node) === "SimpleH3ChainAssemble"
+            ? "Waiting for the final assembled video"
+            : [
             "SimpleH3FinalWindowPreviewAssemble",
             "SimpleH3FinalLatentWindowDecodeAssemble",
         ].includes(nodeType(node))
@@ -276,7 +275,9 @@ function mount(node) {
     const status = style(document.createElement("div"), {
         minHeight: "20px", color: "#aeb7c8", whiteSpace: "pre-wrap",
     });
-    status.textContent = [
+    status.textContent = nodeType(node) === "SimpleH3ChainAssemble"
+        ? "The complete assembled video appears here automatically."
+        : [
         "SimpleH3FinalWindowPreviewAssemble",
         "SimpleH3FinalLatentWindowDecodeAssemble",
     ].includes(nodeType(node))

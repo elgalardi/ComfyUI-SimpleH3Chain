@@ -117,6 +117,12 @@ def _fingerprint(value: Any) -> str:
 
 
 def _safe_name(value: str, fallback: str = "chain") -> str:
+    studio_path = str(value or '').replace('\\', '/')
+    if studio_path.startswith('Sexy AI Studio/'):
+        parts = studio_path.split('/')[1:]
+        if not parts or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', p) for p in parts):
+            raise ValueError('Invalid Studio project path.')
+        return 'Sexy AI Studio/' + '/'.join(parts)
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
     text = text.strip("._-")
     return (text or fallback)[:96]
@@ -4562,7 +4568,7 @@ async def _list_saved_checkpoints(request):
 async def _list_studio_gallery(request):
     """Return persistent Studio outputs independently of ComfyUI history."""
     output_root = os.path.abspath(_output_root())
-    index_path = os.path.join(output_root, ".sexyai_gallery_index.json")
+    index_path = os.path.join(output_root, "Sexy AI Studio", "gallery-index.json")
     try:
         with open(index_path, "r", encoding="utf-8") as index_file:
             gallery_index = json.load(index_file)
@@ -4639,7 +4645,8 @@ async def _save_studio_gallery_index(request):
             if isinstance(key, str) and isinstance(value, dict)
         }
         index_path = os.path.join(
-            os.path.abspath(_output_root()), ".sexyai_gallery_index.json")
+            os.path.abspath(_output_root()), "Sexy AI Studio", "gallery-index.json")
+        os.makedirs(os.path.dirname(index_path), exist_ok=True)
         temporary = index_path + ".tmp"
         with open(temporary, "w", encoding="utf-8") as index_file:
             json.dump(safe_entries, index_file, ensure_ascii=False, indent=2)
