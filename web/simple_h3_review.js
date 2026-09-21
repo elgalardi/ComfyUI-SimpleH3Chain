@@ -2,6 +2,7 @@ import {app} from "/scripts/app.js";
 import {api} from "/scripts/api.js";
 
 const NODE_NAMES = new Set([
+    "SimpleH3DirectEditPreview",
     "SimpleH3ChainAssemble",
 ]);
 const mounted = new Set();

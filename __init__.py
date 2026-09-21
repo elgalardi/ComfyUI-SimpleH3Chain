@@ -17,6 +17,7 @@ import threading
 import uuid
 from datetime import datetime
 
+import torch
 import torch.nn.functional as F
 import folder_paths
 import comfy.sd
@@ -1099,6 +1100,160 @@ class SimpleH3OptionalLoraLoader:
         return (patched_model,)
 
 
+class SimpleH3DirectEditPreview:
+    """Encode and display one complete H3 edit without chain state or segments."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Complete decoded IMAGE batch from the one-pass H3 edit.",
+                }),
+                "fps": ("FLOAT", {
+                    "default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0,
+                }),
+                "filename": ("STRING", {
+                    "default": "%date:yyyy-MM-dd%_h3_direct_edit",
+                }),
+                "save_output": ("BOOLEAN", {"default": True}),
+                "show_preview": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Display the completed MP4 inside this node. Disabling it "
+                        "does not disable permanent saving when save_output is enabled."
+                    ),
+                }),
+            },
+            "optional": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Connect the original source audio for exact-track preview.",
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "video_path", "status")
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    CATEGORY = "MiniMax H3/Simple Chain/Preview"
+    DESCRIPTION = (
+        "Simple final player for one-pass H3 video edits. It accepts decoded frames "
+        "and optional source audio directly, without chain plan, state or segment inputs."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("NaN")
+
+    def preview(
+        self, images, fps, filename, save_output, show_preview, audio=None,
+        prompt=None, extra_pnginfo=None, unique_id=None,
+    ):
+        if not torch.is_tensor(images) or images.ndim != 4 or int(images.shape[0]) < 1:
+            raise ValueError("Direct Edit Preview requires IMAGE [frames,height,width,channels].")
+        frame_rate = int(round(float(fps)))
+        if frame_rate < 1:
+            raise ValueError("Direct Edit Preview fps must be positive.")
+        height, width = int(images.shape[1]), int(images.shape[2])
+        if width % 2 or height % 2:
+            raise ValueError(
+                f"Direct Edit Preview requires even dimensions; received {width}x{height}."
+            )
+        if not bool(save_output) and not bool(show_preview):
+            status = "Direct edit preview and permanent saving disabled"
+            return {"ui": {"text": [status]}, "result": (images, "", status)}
+
+        root = (
+            folder_paths.get_output_directory()
+            if bool(save_output) else folder_paths.get_temp_directory()
+        )
+        subfolder = os.path.join("video", "h3_direct_edit")
+        directory = os.path.join(root, subfolder)
+        os.makedirs(directory, exist_ok=True)
+        base = _chain._safe_name(_expand_date_tokens(str(filename)), "h3_direct_edit")
+        if bool(save_output):
+            path = os.path.join(directory, base + ".mp4")
+            version = 2
+            while os.path.exists(path):
+                path = os.path.join(directory, f"{base}_v{version}.mp4")
+                version += 1
+        else:
+            node_key = _chain._safe_name(str(unique_id or "preview"), "preview")
+            path = os.path.join(directory, f"preview_{node_key}.mp4")
+        transaction = uuid.uuid4().hex
+        silent = os.path.join(directory, f".{transaction}.silent.mp4")
+        wav_path = os.path.join(directory, f".{transaction}.wav")
+        muxed = os.path.join(directory, f".{transaction}.muxed.mp4")
+        metadata_path = os.path.join(directory, f".{transaction}.metadata.txt")
+        try:
+            _chain._write_segment_video(images, silent, frame_rate, 19)
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError(
+                    "Direct Edit Preview requires ffmpeg to embed workflow metadata."
+                )
+            video_metadata = {}
+            if prompt is not None:
+                video_metadata["prompt"] = json.dumps(prompt)
+            if extra_pnginfo is not None:
+                for key, value in extra_pnginfo.items():
+                    video_metadata[key] = value
+            metadata = json.dumps(video_metadata)
+            for source, escaped in (
+                ("\\", "\\\\"), (";", "\\;"), ("#", "\\#"),
+                ("=", "\\="), ("\n", "\\\n"),
+            ):
+                metadata = metadata.replace(source, escaped)
+            with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+                metadata_file.write(";FFMETADATA1\n")
+                metadata_file.write("comment=" + metadata)
+
+            if audio is None:
+                _chain._run_ffmpeg([
+                    ffmpeg, "-y", "-i", silent, "-i", metadata_path,
+                    "-map", "0:v:0", "-map_metadata", "1",
+                    "-c:v", "copy", "-movflags", "+faststart", muxed,
+                ])
+            else:
+                _chain._write_wav(audio, wav_path)
+                duration = float(images.shape[0]) / float(frame_rate)
+                _chain._run_ffmpeg([
+                    ffmpeg, "-y", "-i", silent, "-i", wav_path,
+                    "-i", metadata_path,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-map_metadata", "2",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+                    "-t", f"{duration:.9f}", "-movflags", "+faststart", muxed,
+                ])
+            os.replace(muxed, path)
+            status = (
+                f"One-pass H3 edit preview ready · {int(images.shape[0])} frames · "
+                f"{width}x{height} · {frame_rate} fps · "
+                f"{'source audio' if audio is not None else 'silent'} · workflow metadata"
+            )
+            ui_result = {"text": [status]}
+            if bool(show_preview):
+                ui_result["videos"] = [{
+                    "filename": os.path.basename(path),
+                    "subfolder": subfolder,
+                    "type": "output" if bool(save_output) else "temp",
+                }]
+            return {
+                "ui": ui_result,
+                "result": (images, os.path.abspath(path), status),
+            }
+        finally:
+            for temporary in (silent, wav_path, muxed, metadata_path):
+                if os.path.exists(temporary):
+                    _chain._safe_unlink(temporary)
+
+
 class SimpleH3LatentUpscaleResolution:
     """Resolve a low-resolution H3 first pass from the requested final size."""
 
@@ -1343,7 +1498,19 @@ class SimpleH3LatentUpscaleRefine:
         )
 
 
+from .ultimate_upscale import (
+    SimpleH3UltimateUpscale, SimpleH3LatentUpscaleParams,
+    SimpleH3LatentUpscaleWithModelParams, SimpleH3TemporalSplitParams,
+    SimpleH3SpatialSplitParams,
+)
+
 NODE_CLASS_MAPPINGS = {
+    "SimpleH3UltimateUpscale": SimpleH3UltimateUpscale,
+    "SimpleH3LatentUpscaleParams": SimpleH3LatentUpscaleParams,
+    "SimpleH3LatentUpscaleWithModelParams": SimpleH3LatentUpscaleWithModelParams,
+    "SimpleH3TemporalSplitParams": SimpleH3TemporalSplitParams,
+    "SimpleH3SpatialSplitParams": SimpleH3SpatialSplitParams,
+    "SimpleH3DirectEditPreview": SimpleH3DirectEditPreview,
     "SimpleH3FrameGate": SimpleH3FrameGate,
     "SimpleH3OptionalLoraLoader": SimpleH3OptionalLoraLoader,
     "SimpleH3LatentUpscaleResolution": SimpleH3LatentUpscaleResolution,
@@ -1362,6 +1529,12 @@ NODE_CLASS_MAPPINGS.update(_LONG_EDIT_NODE_CLASS_MAPPINGS)
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SimpleH3UltimateUpscale": "Simple H3 Ultimate Upscale",
+    "SimpleH3LatentUpscaleParams": "Simple H3 Upscale Params — Interpolation",
+    "SimpleH3LatentUpscaleWithModelParams": "Simple H3 Upscale Params — Learned Model",
+    "SimpleH3TemporalSplitParams": "Simple H3 Upscale — Temporal Split",
+    "SimpleH3SpatialSplitParams": "Simple H3 Upscale — Spatial Split",
+    "SimpleH3DirectEditPreview": "Simple H3 Direct Edit Preview — Video + Source Audio",
     "SimpleH3FrameGate": "Simple H3 Frame Gate — First / Last Frame",
     "SimpleH3OptionalLoraLoader": "Simple H3 Load LoRA — Optional",
     "SimpleH3LatentUpscaleResolution": "Simple H3 Latent Upscale — Resolution",

@@ -4,15 +4,21 @@ Focused orchestration for the current Ref2VA, FL2VA and still-image workflows.
 Native MiniMax H3 model loading, conditioning, sampling and decoding remain
 unchanged. Context Loop does not need to be installed separately.
 
-## Included nodes (17)
+## Included nodes (23)
 
 - Scene chain: `SimpleH3ChainPlan`, `SimpleH3ChainLoopStart`,
   `SimpleH3ChainCurrent`, `SimpleH3ChainContext`, `SimpleH3LoopTrim`,
   `SimpleH3ChainSegmentSave`, `SimpleH3ChainLoopEnd`, `SimpleH3ChainAssemble`.
 - Prompt plan: `SimpleH3CompactContinuousPlanJSON`.
 - Frame routing: `SimpleH3FrameGate`.
+- Local video preview: `SimpleH3DirectEditPreview`. With `save_output=false`,
+  one temporary MP4 per node is overwritten rather than creating saved copies.
 - Optional model LoRA: `SimpleH3OptionalLoraLoader`.
 - Optional upscale: `SimpleH3LatentUpscaleResolution`, `SimpleH3LatentUpscaleRefine`.
+- Ultimate upscale: `SimpleH3UltimateUpscale`, `SimpleH3LatentUpscaleParams`,
+  `SimpleH3LatentUpscaleWithModelParams`, `SimpleH3TemporalSplitParams`,
+  `SimpleH3SpatialSplitParams`. See [ULTIMATE_UPSCALE.md](ULTIMATE_UPSCALE.md)
+  for the default `keep_model_loaded` behavior and memory tradeoffs.
 - Still image: `SimpleH3ImageBatchPrepare`, `SimpleH3ImageSampling`,
   `SimpleH3ImageDecode`, `SimpleH3ImageSelect`.
 
