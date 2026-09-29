@@ -27,10 +27,6 @@ from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
 from .stable_engine import chain_nodes as _chain
 from .stable_engine import nodes as _context
 from .frame_gate import SimpleH3FrameGate
-from .still_nodes import (
-    NODE_CLASS_MAPPINGS as _STILL_NODE_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as _STILL_NODE_DISPLAY_NAME_MAPPINGS,
-)
 from .image_nodes import (
     NODE_CLASS_MAPPINGS as _IMAGE_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as _IMAGE_NODE_DISPLAY_NAME_MAPPINGS,
@@ -1529,7 +1525,6 @@ NODE_CLASS_MAPPINGS = {
     "SimpleH3ChainAssemble": SimpleH3ChainAssemble,
 }
 NODE_CLASS_MAPPINGS.update(_IMAGE_NODE_CLASS_MAPPINGS)
-NODE_CLASS_MAPPINGS.update(_STILL_NODE_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS.update(_LONG_EDIT_NODE_CLASS_MAPPINGS)
 
 
@@ -1554,7 +1549,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3ChainAssemble": "Simple H3 Assemble Final Video",
 }
 NODE_DISPLAY_NAME_MAPPINGS.update(_IMAGE_NODE_DISPLAY_NAME_MAPPINGS)
-NODE_DISPLAY_NAME_MAPPINGS.update(_STILL_NODE_DISPLAY_NAME_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(_LONG_EDIT_NODE_DISPLAY_NAME_MAPPINGS)
 
 
