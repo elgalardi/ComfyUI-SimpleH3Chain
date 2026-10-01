@@ -4,6 +4,7 @@ The graph surface is ours; low-level tensor conventions come directly from
 ComfyUI's native MiniMax H3 implementation.
 """
 
+import math
 import re
 
 import torch
@@ -267,7 +268,41 @@ class SimpleH3ImageSelect:
         return frames[index:index + 1].clone(), frames, index, f"selected frame {index}/{count - 1} by {selection}"
 
 
+class SimpleH3DimensionsScale:
+    """Calculate a target canvas without loading or resizing an image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "width": ("INT", {"default": 1920, "min": 1, "max": 1048576, "forceInput": True}),
+            "height": ("INT", {"default": 1080, "min": 1, "max": 1048576, "forceInput": True}),
+            "megapixels": ("FLOAT", {"default": 2.0, "min": 0.01, "max": 256.0, "step": 0.1,
+                                     "tooltip": "Target pixel area in decimal megapixels. Rounding to the multiple may change the final area slightly."}),
+            "multiple": ("INT", {"default": 32, "min": 1, "max": 4096, "step": 1,
+                                 "tooltip": "Both output dimensions are rounded to the nearest positive multiple."}),
+        }}
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("width", "height")
+    FUNCTION = "scale"
+    CATEGORY = CATEGORY
+
+    def scale(self, width, height, megapixels, multiple):
+        width, height, multiple = int(width), int(height), int(multiple)
+        megapixels = float(megapixels)
+        if width <= 0 or height <= 0 or multiple <= 0:
+            raise ValueError("Width, height and multiple must be positive.")
+        if not math.isfinite(megapixels) or megapixels <= 0:
+            raise ValueError("Megapixels must be finite and positive.")
+        factor = math.sqrt(megapixels * 1_000_000 / (width * height))
+        return tuple(
+            max(1, math.floor(dimension * factor / multiple + 0.5)) * multiple
+            for dimension in (width, height)
+        )
+
+
 NODE_CLASS_MAPPINGS = {
+    "SimpleH3DimensionsScale": SimpleH3DimensionsScale,
     "SimpleH3ImageBatchPrepare": SimpleH3ImageBatchPrepare,
     "SimpleH3ImageSampling": SimpleH3ImageSampling,
     "SimpleH3ImageDecode": SimpleH3ImageDecode,
@@ -275,6 +310,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SimpleH3DimensionsScale": "Simple H3 Dimensions Scale",
     "SimpleH3ImageBatchPrepare": "Simple H3 Image Batch Prepare (1–4)",
     "SimpleH3ImageSampling": "Simple H3 Image Sampling",
     "SimpleH3ImageDecode": "Simple H3 Image Decode",

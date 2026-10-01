@@ -4,7 +4,7 @@ Focused orchestration for the current Ref2VA, FL2VA and still-image workflows.
 Native MiniMax H3 model loading, conditioning, sampling and decoding remain
 unchanged. Context Loop does not need to be installed separately.
 
-## Included nodes (23)
+## Included nodes (24)
 
 - Scene chain: `SimpleH3ChainPlan`, `SimpleH3ChainLoopStart`,
   `SimpleH3ChainCurrent`, `SimpleH3ChainContext`, `SimpleH3LoopTrim`,
@@ -21,6 +21,11 @@ unchanged. Context Loop does not need to be installed separately.
   for the default `keep_model_loaded` behavior and memory tradeoffs.
 - Still image: `SimpleH3ImageBatchPrepare`, `SimpleH3ImageSampling`,
   `SimpleH3ImageDecode`, `SimpleH3ImageSelect`.
+- Canvas calculator: `SimpleH3DimensionsScale` takes numeric `width` and `height`,
+  scales their pixel area to the selected decimal megapixels, and rounds both
+  outputs to the nearest positive `multiple` (default 32). Aspect ratio and pixel
+  area are approximate after rounding. It does not resize an image or latent and
+  works independently of the generation model.
 
 ## First / last frame routing
 
