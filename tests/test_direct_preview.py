@@ -15,7 +15,7 @@ class PreviewTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / '__init__.py').read_text(encoding='utf-8')
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)
                     and n.name == 'SimpleH3DirectEditPreview')
-        chain = SimpleNamespace(_safe_name=lambda value, fallback: value or fallback,
+        chain = SimpleNamespace(_safe_name=lambda value, fallback='preview': value or fallback,
                                 _write_segment_video=Mock(), _run_ffmpeg=Mock(),
                                 _safe_unlink=Mock())
         scope = dict(torch=SimpleNamespace(is_tensor=lambda value: True),
@@ -33,6 +33,8 @@ class PreviewTests(unittest.TestCase):
             second = cls().preview(frames, 24, 'another-name', False, True, unique_id='3604')
             other = cls().preview(frames, 24, 'first-name', False, True, unique_id='3605')
             disabled = cls().preview(frames, 24, 'unused', False, False)
+            studio = cls().preview(frames, 24, 'unused', False, True, unique_id='3604',
+                                  preview_output_subfolder='Sexy AI Studio/Previews')
         media = first['ui']['videos'][0]
         self.assertEqual(media['type'], 'temp')
         self.assertEqual(media['filename'], 'preview_3604.mp4')
@@ -41,6 +43,10 @@ class PreviewTests(unittest.TestCase):
         self.assertIs(first['result'][0], frames)
         self.assertNotIn('videos', disabled['ui'])
         self.assertEqual(cls.RETURN_TYPES, ('IMAGE', 'STRING', 'STRING'))
+        self.assertEqual(studio['ui']['videos'][0]['type'], 'output')
+        self.assertEqual(studio['ui']['videos'][0]['subfolder'], 'Sexy AI Studio/Previews')
+        self.assertEqual(studio['ui']['videos'][0]['filename'], 'preview_3604.mp4')
+        self.assertIn('output', studio['result'][1])
 
 
 if __name__ == '__main__':

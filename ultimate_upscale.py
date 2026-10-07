@@ -54,6 +54,7 @@ except Exception:
 H3_UPSCALE_PARAM = io.Custom("H3_UPSCALE_PARAM")
 H3_TEMPORAL_PARAM = io.Custom("H3_TEMPORAL_PARAM")
 H3_SPATIAL_PARAM = io.Custom("H3_SPATIAL_PARAM")
+H3_CHAIN_STATE = io.Custom("H3_CHAIN_STATE")
 
 # Spatial compression factor of the Minimax H3 3D VAE (16x).
 VAE_DOWNSAMPLE = 16
@@ -903,7 +904,7 @@ def _compute_upscale_target(width, height, h_in, w_in):
     return h_out, w_out, eff
 
 
-def upscale_video(video, param):
+def upscale_video(video, param, model_cache=None):
     """Upscale one chunk's video latent with the H3 3D upscaler. Audio untouched.
 
     Returns (upscaled_video, new_h, new_w). The target is computed in pixel
@@ -931,7 +932,11 @@ def upscale_video(video, param):
         raise ValueError("Please place H3 upscale model files into the latent_upscale_models directory")
 
     s = video.to(device=dev, dtype=compute_dtype, copy=True)
-    model = load_upscale_model(model_name, dev, precision)
+    key = (model_name, str(dev), precision)
+    if model_cache is not None and key in model_cache:
+        model = model_cache[key].to(dev)
+    else:
+        model = load_upscale_model(model_name, dev, precision)
     norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
 
     s = s.sub(norm_mean).div(norm_std)
@@ -941,7 +946,10 @@ def upscale_video(video, param):
 
     out = out.to(device="cpu", dtype=orig_dtype)
     model.to('cpu')
-    del model
+    if model_cache is not None:
+        model_cache[key] = model
+    else:
+        del model
     return out, h_out, w_out
 
 
@@ -964,11 +972,11 @@ def upscale_video_interp(video, param):
     return up, h_out, w_out
 
 
-def upscale_latent(video, param):
+def upscale_latent(video, param, model_cache=None):
     """Dispatch a chunk's video upscale: H3 3D model (param has 'model_name') or
     model-free interpolation (param has 'method'). Audio is never touched."""
     if "model_name" in param:
-        return upscale_video(video, param)
+        return upscale_video(video, param, model_cache=model_cache)
     return upscale_video_interp(video, param)
 
 
@@ -1140,7 +1148,7 @@ class _ZeroNoise:
 
 
 def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
-                          sigmas, negative, cfg):
+                          sigmas, negative, cfg, video_mask=None):
     """Tiles that are stepped TOGETHER instead of finished one at a time.
 
     WHY THIS EXISTS.
@@ -1242,6 +1250,8 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
             r0, c0, tr, tc = td["r0"], td["c0"], td["tr"], td["tc"]
             xt = x[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
             mv = torch.ones((1, 1, 1, tr, tc), device=dev, dtype=torch.float32)
+            if video_mask is not None:
+                mv = video_mask[:, :, :, r0:r0 + tr, c0:c0 + tc]
             piece = {
                 "samples": comfy.nested_tensor.NestedTensor((xt, audio_out)),
                 "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma)),
@@ -1255,9 +1265,13 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
             out = sample_piece(piece, td["cond"], model, n, sampler, two,
                                negative, cfg)
             ot = out.tensors[0].to(device=dev, dtype=torch.float32)
+            if video_mask is not None:
+                ot = torch.where(mv == 0, xt.to(dtype=torch.float32), ot)
             acc[:, :, :, r0:r0 + tr, c0:c0 + tc] += ot * td["mask"]
             wsum[:, :, :, r0:r0 + tr, c0:c0 + tc] += td["mask"][:, :, 0]
         x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+        if video_mask is not None:
+            x = torch.where(video_mask == 0, chunk_v, x)
 
     info = {"rows": rows, "cols": cols, "tile_rows": trows, "tile_cols": tcols,
             "row_overlaps": row_ovl, "col_overlaps": col_ovl,
@@ -1266,7 +1280,8 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
     return x, info
 
 
-def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, negative, cfg):
+def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, negative, cfg,
+                    video_mask=None):
     """Inner loop: spatial split -> per-tile sampling -> spatial stitch.
     Mirrors the spatial split/extract/append trio. Audio is carried unchanged
     (frozen in every tile, never re-sampled). Returns (reassembled_video, info)."""
@@ -1355,6 +1370,8 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                                   done_top=(i > 0), done_left=(j > 0),
                                   fade_h=fh, fade_w=fw)
             mv = m[None, None, None]
+            if video_mask is not None:
+                mv = mv * video_mask[:, :, :, r0:r0 + tr, c0:c0 + tc]
             ma = torch.zeros((1, 32, 2, ta), device=chunk_a.device, dtype=chunk_a.dtype)
             piece = {
                 "samples": comfy.nested_tensor.NestedTensor((tile, chunk_a)),
@@ -1369,6 +1386,9 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                     (_nv, _tiled_noise[1])))
             out = sample_piece(piece, cond_tile, model, _n, sampler, sigmas, negative, cfg)
             tile_v = out.tensors[0]
+            if video_mask is not None:
+                locked = video_mask[:, :, :, r0:r0 + tr, c0:c0 + tc] == 0
+                tile_v = torch.where(locked, chunk_v[:, :, :, r0:r0 + tr, c0:c0 + tc], tile_v)
 
             region = acc_v[:, :, :, r0:r0 + tr, c0:c0 + tc].clone()
             if j > 0 and ovw > 0:
@@ -1388,6 +1408,9 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                 band[:, :, :, :ovh, :] = True
             region = torch.where(band, region, tile_v)
             acc_v[:, :, :, r0:r0 + tr, c0:c0 + tc] = region
+
+    if video_mask is not None:
+        acc_v = torch.where(video_mask == 0, chunk_v, acc_v)
 
     return acc_v, tile_info
 
@@ -1746,6 +1769,8 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                                         tooltip="Output of 'SimpleH3 Temporal Split Params'. Leave unconnected to process the latent as a single chunk."),
                 H3_SPATIAL_PARAM.Input("spatial_split_param", optional=True,
                                        tooltip="Output of 'SimpleH3 Spatial Split Params'. Leave unconnected to sample each chunk whole (no tiling)."),
+                H3_CHAIN_STATE.Input("state", optional=True,
+                                     tooltip="Current Scene state for protected previous-refined context in Masked AV scene chains."),
             ],
             outputs=[
                 io.Latent.Output("latent", tooltip="Upscaled, re-sampled, stitched MiniMax H3 AV latent."),
@@ -1753,6 +1778,8 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                                tooltip="DEBUG ONLY. Per-chunk metadata: frame start/count, video/audio token ranges, upscale applied."),
                 io.Dict.Output("tiles_info",
                                tooltip="DEBUG ONLY. Per-chunk spatial grid metadata: offsets, tile extents, overlaps, stitching mode."),
+                io.Latent.Output("context_latent",
+                                 tooltip="Base sampled latent plus the compact refined tail. Connect to scene checkpoints and Loop End, not to the high-resolution decoder."),
             ],
         )
 
@@ -1760,7 +1787,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
     def execute(cls, latent, conditioning, model, noise, sampler, sigmas,
                 negative=None, cfg=1.0,
                 temporal_split_param=None, spatial_split_param=None,
-                latent_upscale_param=None, keep_model_loaded=True) -> io.NodeOutput:
+                latent_upscale_param=None, keep_model_loaded=True, state=None) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("SimpleH3UltimateUpscale expects a MiniMax H3 AV latent (nested video [B,24,T,H,W] + audio [B,32,2,T])")
@@ -1801,6 +1828,19 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
 
         tv = video.shape[2]
         ta = audio.shape[-1]
+        context_frames = 39
+        previous_video = None
+        if state is not None:
+            cfg_plan = state["plan"]["compatibility"]
+            context_frames = int(cfg_plan["context_length"])
+            masked_chain = "type=masked_av" in str(cfg_plan.get("generation_fingerprint", ""))
+            previous = state.get("previous_refined_latent") if masked_chain else None
+            if previous is not None:
+                parts = previous["samples"]
+                previous_video = parts[0] if isinstance(parts, (list, tuple)) else parts.tensors[0]
+            elif masked_chain and int(state["index"]) > 1:
+                raise ValueError("Refined continuity checkpoint is missing. Start scene 1 in a new project folder.")
+        protected_tokens = tokens_for_frames(context_frames) if previous_video is not None else 0
 
         if temporal_split_param is not None:
             chunk_length = int(temporal_split_param["chunk_length"])
@@ -1816,6 +1856,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
         acc_a = None
         segments_debug = []
         tiles_debug = []
+        upscale_models = {}
 
         for i, (k0, f0, k1, f1) in enumerate(bounds):
             chunk_v = video[:, :, k0:k1].contiguous()
@@ -1835,8 +1876,20 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                     # diffusion model so they don't reside simultaneously
                     comfy.model_management.unload_model_and_clones(model, unload_additional_models=False)
                     comfy.model_management.soft_empty_cache()
-                chunk_v, _, _ = upscale_latent(chunk_v, latent_upscale_param)
+                chunk_v, _, _ = upscale_latent(chunk_v, latent_upscale_param,
+                                               model_cache=upscale_models)
                 upscaled = True
+
+            chunk_mask = None
+            locked = max(0, min(k1, protected_tokens) - k0)
+            if locked:
+                if tuple(previous_video.shape[-2:]) != tuple(chunk_v.shape[-2:]):
+                    raise ValueError("The saved refined context uses a different delivery resolution. Start a new project.")
+                chunk_v = chunk_v.clone()
+                chunk_v[:, :, :locked] = previous_video[:, :, -protected_tokens:][:, :, k0:k0 + locked].to(chunk_v)
+                chunk_mask = torch.ones((1, 1, chunk_v.shape[2], *chunk_v.shape[-2:]),
+                                        device=chunk_v.device, dtype=torch.float32)
+                chunk_mask[:, :, :locked] = 0
 
             # 2. time re-anchor; keyframe video latents are always resized to the
             #    (possibly upscaled) chunk size - the H3 packed layout requires
@@ -1855,17 +1908,25 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                 chunk_out_v, tile_info = _fn(
                     chunk_v, chunk_a, cond_i, spatial_split_param,
                     model, noise, sampler, sigmas, negative, cfg,
+                    video_mask=chunk_mask,
                 )
                 tile_info = dict(tile_info)
                 tile_info["chunk"] = i
                 tiles_debug.append(tile_info)
             else:
                 piece = {"samples": comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))}
+                if chunk_mask is not None:
+                    piece["noise_mask"] = comfy.nested_tensor.NestedTensor((
+                        chunk_mask, torch.zeros_like(chunk_a)))
                 out = sample_piece(piece, cond_i, model, noise, sampler, sigmas, negative, cfg)
                 chunk_out_v = out.tensors[0]
+            if chunk_mask is not None:
+                chunk_out_v = torch.where(chunk_mask == 0, chunk_v, chunk_out_v)
 
             # 5. temporal stitch
             acc_v, acc_a = temporal_append(acc_v, acc_a, chunk_out_v, chunk_a, i, k0, f0)
+            if locked:
+                acc_v[:, :, k0:k0 + locked] = chunk_v[:, :, :locked]
 
             segments_debug.append({
                 "chunk": i,
@@ -1876,6 +1937,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                 "upscaled": upscaled,
                 "spatial_h": chunk_v.shape[3],
                 "spatial_w": chunk_v.shape[4],
+                "protected_video_tokens": locked,
             })
 
         # all chunks sampled & stitched: the diffusion model is no longer needed,
@@ -1885,4 +1947,11 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
             comfy.model_management.soft_empty_cache()
 
         out = {"samples": comfy.nested_tensor.NestedTensor((acc_v, acc_a))}
-        return io.NodeOutput(out, segments_debug, tiles_debug)
+        upscale_models.clear()
+        context = dict(latent)
+        if state is not None:
+            tail_tokens = min(tokens_for_frames(context_frames), int(acc_v.shape[2]))
+            audio_tokens = min(round(context_frames * FRAME_RESCALE), int(acc_a.shape[-1]))
+            context["_simple_h3_refined_latent"] = {"samples": comfy.nested_tensor.NestedTensor((
+                acc_v[:, :, -tail_tokens:].clone(), acc_a[..., -audio_tokens:].clone()))}
+        return io.NodeOutput(out, segments_debug, tiles_debug, context)

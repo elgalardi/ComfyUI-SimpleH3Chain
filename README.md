@@ -4,15 +4,22 @@ Focused orchestration for the current Ref2VA, FL2VA and still-image workflows.
 Native MiniMax H3 model loading, conditioning, sampling and decoding remain
 unchanged. Context Loop does not need to be installed separately.
 
-## Included nodes (24)
+## Included nodes (26)
 
 - Scene chain: `SimpleH3ChainPlan`, `SimpleH3ChainLoopStart`,
   `SimpleH3ChainCurrent`, `SimpleH3ChainContext`, `SimpleH3LoopTrim`,
   `SimpleH3ChainSegmentSave`, `SimpleH3ChainLoopEnd`, `SimpleH3ChainAssemble`.
 - Prompt plan: `SimpleH3CompactContinuousPlanJSON`.
+- Base context decode: `SimpleH3BaseContextDecode` decodes the aligned tail only
+  when Plan's `base_preview=false`; it displays no video and avoids a full base decode.
+- Existing-video continuation: `SimpleH3ExistingVideoContext` prepares a base-size
+  tail for Start / Resume. When `prepend_original=true`, the original is
+  normalized to 24 fps and the optional delivery canvas before final assembly.
 - Frame routing: `SimpleH3FrameGate`.
 - Local video preview: `SimpleH3DirectEditPreview`. With `save_output=false`,
   one temporary MP4 per node is overwritten rather than creating saved copies.
+  Set `preview_output_subfolder=Sexy AI Studio/Previews` to keep these
+  overwrite-only files under the output directory instead of the temp directory.
 - Optional model LoRA: `SimpleH3OptionalLoraLoader`.
 - Optional upscale: `SimpleH3LatentUpscaleResolution`, `SimpleH3LatentUpscaleRefine`.
 - Ultimate upscale: `SimpleH3UltimateUpscale`, `SimpleH3LatentUpscaleParams`,
@@ -26,6 +33,33 @@ unchanged. Context Loop does not need to be installed separately.
   outputs to the nearest positive `multiple` (default 32). Aspect ratio and pixel
   area are approximate after rounding. It does not resize an image or latent and
   works independently of the generation model.
+
+## Two-pass scene delivery
+
+For base generation followed by Ultimate Upscale, connect the raw **base**
+sampler output and trimmed **base** images to Save Scene's checkpoint inputs
+and Loop End. Connect trimmed **refined** images to Save Scene's optional
+`delivery_images`, and refined trimmed audio to its audio input. Use the same
+Context trim contract on both branches. With a regular full-scene base decoder,
+keep `base_preview=true`. For tail-only operation, use `SimpleH3BaseContextDecode`,
+set `base_preview=false`, and connect that tail directly to checkpoint/Loop End
+image inputs. Set the refined Trim's `delivery_frames=true` so it still trims
+the complete HQ decode. See [ULTIMATE_UPSCALE.md](ULTIMATE_UPSCALE.md) for refined
+prefix protection and checkpoint wiring.
+
+Connect final `delivery_width` and `delivery_height` to Chain Plan together.
+These dimensions participate in the generation fingerprint and imported-video
+validation, without changing the base sampling/context canvas. The final
+assembly uses refined MP4 segments; resume checkpoints retain base latents.
+Older graphs without these optional inputs keep their existing behavior.
+Save Scene's `show_preview=true` displays its saved MP4 directly. Connected
+audio is muxed without re-encoding the video; a separate Direct Edit Preview
+is not needed. There is no approval pause.
+
+`SimpleH3ExistingVideoContext` accepts either native VIDEO or decoded
+IMAGE/AUDIO, never both routes. Imported videos must contain enough frames for
+the plan's context (39 frames for Masked AV). It does not provide a streaming
+decoder: loading a long video can require substantial system RAM.
 
 ## First / last frame routing
 

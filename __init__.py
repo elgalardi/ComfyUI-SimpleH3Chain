@@ -153,6 +153,10 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
                         "Clips. It selects the join contract without duplicated widgets."
                     ),
                 }),
+                "delivery_width": ("INT", {"forceInput": True, "min": 32,
+                    "tooltip": "Final refined width; base context stays at the plan resolution."}),
+                "delivery_height": ("INT", {"forceInput": True, "min": 32,
+                    "tooltip": "Final refined height; connect together with delivery_width."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -202,10 +206,17 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         after the user switches the Context node to video (or vice versa).
         """
         return hashlib.sha256(json.dumps(
-            cls._context_configuration(prompt),
+            (cls._context_configuration(prompt), cls._has_refined_continuity(prompt)),
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _has_refined_continuity(prompt):
+        return isinstance(prompt, dict) and any(
+            isinstance(node, dict) and node.get("class_type") == "SimpleH3UltimateUpscale"
+            and node.get("inputs", {}).get("state") is not None
+            for node in prompt.values())
 
     @staticmethod
     def _audio_context_value(context_frames, context_type, setting):
@@ -254,6 +265,8 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         base_preview,
         block_config=None,
         prompt=None,
+        delivery_width=None,
+        delivery_height=None,
     ):
         context_frames, context_type, audio_context_frames, audio_feather_ticks = (
             self._context_configuration(prompt)
@@ -324,6 +337,15 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             f"audio_context={audio_context_frames}:feather={audio_feather_ticks}:"
             f"base_preview={int(bool(base_preview))}{cut_contract}"
         )
+        if (delivery_width is None) != (delivery_height is None):
+            raise ValueError("Connect both delivery dimensions or neither.")
+        if delivery_width is not None:
+            delivery_width, delivery_height = int(delivery_width), int(delivery_height)
+            if min(delivery_width, delivery_height) < 32:
+                raise ValueError("Delivery dimensions must be at least 32 pixels.")
+            fingerprint += f":delivery={delivery_width}x{delivery_height}"
+        if self._has_refined_continuity(prompt):
+            fingerprint += ":refined_prefix=v1"
         result = super().build(
             plan_json=plan_json_input,
             run_name=run_name,
@@ -357,6 +379,9 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         )
         result[0]["base_preview"] = bool(base_preview)
         result[0]["compatibility"]["base_preview"] = bool(base_preview)
+        if delivery_width is not None:
+            result[0]["compatibility"].update(
+                delivery_width=delivery_width, delivery_height=delivery_height)
         return result + (
             self._format_plan_preview(result[0], context_type), bool(base_preview)
         )
@@ -421,6 +446,8 @@ class SimpleH3ChainLoopStart(_chain.MiniMaxH3ChainLoopStart):
                 }),
             },
             "optional": {
+                "external_context": (_chain.EXTERNAL_CONTEXT_TYPE, {
+                    "tooltip": "Prepared tail of an existing video to continue."}),
                 "source_audio": ("AUDIO", {
                     "tooltip": "Source soundtrack or short audio reference, depending on audio_mode.",
                 }),
@@ -431,6 +458,34 @@ class SimpleH3ChainLoopStart(_chain.MiniMaxH3ChainLoopStart):
         }
 
     DESCRIPTION = "Start a new chain or resume it from a saved scene checkpoint."
+
+
+class SimpleH3ExistingVideoContext(_chain.MiniMaxH3ChainExternalVideo):
+    """Keep continuation context at base size and optional original at delivery size."""
+
+    CATEGORY = "MiniMax H3/Simple Chain"
+
+    def prepare(self, plan, source_fps=24.0, prepend_original=True,
+                source_video=None, source_frames=None, source_audio=None):
+        frames, audio, fps, _ = _chain._resolve_video_inputs(
+            source_video, source_frames, source_audio, source_fps,
+            "Simple H3 existing video")
+        context, status = super().prepare(
+            plan, source_fps=fps, prepend_original=False,
+            source_frames=frames, source_audio=audio)
+        if prepend_original:
+            delivery_plan = dict(plan)
+            compatibility = dict(plan["compatibility"])
+            compatibility["width"] = compatibility.get("delivery_width", compatibility["width"])
+            compatibility["height"] = compatibility.get("delivery_height", compatibility["height"])
+            delivery_plan["compatibility"] = compatibility
+            delivery, _ = super().prepare(
+                delivery_plan, source_fps=fps, prepend_original=True,
+                source_frames=frames, source_audio=audio)
+            context["prelude"] = delivery["prelude"]
+            status = status.replace("will not be prepended", "will be prepended")
+            status += " Original video included at the delivery resolution."
+        return context, status
 
 
 class SimpleH3ChainCurrent(_chain.MiniMaxH3ChainCurrent):
@@ -711,6 +766,35 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
         return (out, trim_contract, True, latent)
 
 
+class SimpleH3BaseContextDecode:
+    """Decode only the aligned base tail needed by continuation/checkpoints."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"state": (_chain.STATE_TYPE,),
+                             "samples": ("LATENT",), "vae": ("VAE",)}}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "status")
+    FUNCTION = "decode"
+    CATEGORY = "MiniMax H3/Simple Chain"
+
+    def decode(self, state, samples, vae):
+        video = _chain._streams_from_latent(samples)[0]
+        context_frames = int(state["plan"]["compatibility"]["context_length"])
+        full = bool(state["plan"].get("base_preview", True))
+        # Twelve aligned tokens decode to the native 39-frame AV context.
+        tokens = (1 if context_frames <= 1 else
+                  2 + 5 * math.ceil(max(0, context_frames - 5) / 17))
+        selected = video if full else video[:, :, -tokens:].contiguous()
+        images = vae.decode(selected)
+        if images.ndim == 5:
+            images = images.reshape(-1, *images.shape[-3:])
+        if not full:
+            images = images[-context_frames:]
+        return images, f"Base decode: {'complete scene' if full else 'context tail only'} / {int(images.shape[0])} frames"
+
+
 class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
     CATEGORY = "MiniMax H3/Simple Chain"
 
@@ -727,6 +811,9 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
                 }),
             },
             "optional": {
+                "delivery_frames": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Trim full refined delivery even when the plan decodes only base context."}),
                 "audio": ("AUDIO", {
                     "tooltip": "Decoded scene audio. It is trimmed and frame-locked automatically at 24 fps.",
                 }),
@@ -739,11 +826,12 @@ class SimpleH3LoopTrim(_context.MiniMaxH3LoopTrim):
             },
         }
 
-    def trim(self, images, trim_frames, audio=None, state=None):
+    def trim(self, images, trim_frames, audio=None, state=None, delivery_frames=False):
         head_trim = int(getattr(trim_frames, "head", int(trim_frames)))
         tail_trim = int(getattr(trim_frames, "tail", 0))
         plan = state["plan"] if isinstance(state, dict) else None
         base_preview = bool(plan.get("base_preview", True)) if plan else True
+        base_preview = base_preview or bool(delivery_frames)
         shot = plan["shots"][int(state["index"]) - 1] if plan else None
         if not base_preview:
             context_length = int(plan["compatibility"]["context_length"])
@@ -1126,6 +1214,9 @@ class SimpleH3DirectEditPreview:
                 }),
             },
             "optional": {
+                "preview_output_subfolder": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional output subfolder for overwrite-only previews, e.g. Sexy AI Studio/Previews. Empty keeps the existing temp behavior."}),
                 "audio": ("AUDIO", {
                     "tooltip": "Connect the original source audio for exact-track preview.",
                 }),
@@ -1154,6 +1245,7 @@ class SimpleH3DirectEditPreview:
     def preview(
         self, images, fps, filename, save_output, show_preview, audio=None,
         prompt=None, extra_pnginfo=None, unique_id=None,
+        preview_output_subfolder="",
     ):
         if not torch.is_tensor(images) or images.ndim != 4 or int(images.shape[0]) < 1:
             raise ValueError("Direct Edit Preview requires IMAGE [frames,height,width,channels].")
@@ -1169,11 +1261,13 @@ class SimpleH3DirectEditPreview:
             status = "Direct edit preview and permanent saving disabled"
             return {"ui": {"text": [status]}, "result": (images, "", status)}
 
+        output_preview = bool(str(preview_output_subfolder).strip())
         root = (
             folder_paths.get_output_directory()
-            if bool(save_output) else folder_paths.get_temp_directory()
+            if bool(save_output) or output_preview else folder_paths.get_temp_directory()
         )
-        subfolder = os.path.join("video", "h3_direct_edit")
+        subfolder = (_chain._safe_name(str(preview_output_subfolder).strip())
+                     if output_preview else os.path.join("video", "h3_direct_edit"))
         directory = os.path.join(root, subfolder)
         os.makedirs(directory, exist_ok=True)
         base = _chain._safe_name(_expand_date_tokens(str(filename)), "h3_direct_edit")
@@ -1242,7 +1336,7 @@ class SimpleH3DirectEditPreview:
                 ui_result["videos"] = [{
                     "filename": os.path.basename(path),
                     "subfolder": subfolder,
-                    "type": "output" if bool(save_output) else "temp",
+                    "type": "output" if bool(save_output) or output_preview else "temp",
                 }]
             return {
                 "ui": ui_result,
@@ -1517,9 +1611,11 @@ NODE_CLASS_MAPPINGS = {
     "SimpleH3LatentUpscaleRefine": SimpleH3LatentUpscaleRefine,
     "SimpleH3ChainPlan": SimpleH3ChainPlan,
     "SimpleH3ChainLoopStart": SimpleH3ChainLoopStart,
+    "SimpleH3ExistingVideoContext": SimpleH3ExistingVideoContext,
     "SimpleH3ChainCurrent": SimpleH3ChainCurrent,
     "SimpleH3ChainContext": SimpleH3ChainContext,
     "SimpleH3LoopTrim": SimpleH3LoopTrim,
+    "SimpleH3BaseContextDecode": SimpleH3BaseContextDecode,
     "SimpleH3ChainSegmentSave": SimpleH3ChainSegmentSave,
     "SimpleH3ChainLoopEnd": SimpleH3ChainLoopEnd,
     "SimpleH3ChainAssemble": SimpleH3ChainAssemble,
@@ -1541,9 +1637,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3LatentUpscaleRefine": "Simple H3 Latent Upscale + Refine — Optional",
     "SimpleH3ChainPlan": "Simple H3 Chain Plan",
     "SimpleH3ChainLoopStart": "Simple H3 Start / Resume",
+    "SimpleH3ExistingVideoContext": "Simple H3 Existing Video — Continuation Context",
     "SimpleH3ChainCurrent": "Simple H3 Current Scene — Prompt / Seed / Timing",
     "SimpleH3ChainContext": "Simple H3 Context — Masked AV / Masked Cut",
     "SimpleH3LoopTrim": "Simple H3 Trim + Lock Audio",
+    "SimpleH3BaseContextDecode": "Simple H3 Base Decode — Context Tail Only",
     "SimpleH3ChainSegmentSave": "Simple H3 Save Scene + Checkpoint",
     "SimpleH3ChainLoopEnd": "Simple H3 Loop Until Final Scene",
     "SimpleH3ChainAssemble": "Simple H3 Assemble Final Video",

@@ -2470,6 +2470,11 @@ class MiniMaxH3ChainSegmentSave:
                                "Contex Loop Trim with match_tail enabled. "
                                "Required for "
                                "generated_audio and synchronized review."}),
+                "delivery_images": ("IMAGE", {
+                    "tooltip": "Optional refined frames AFTER the same trim. Saved to video; base images and latents remain the continuation checkpoint."}),
+                "show_preview": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Display the saved scene itself, with audio when connected. No second video encode or review pause."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -2520,7 +2525,7 @@ class MiniMaxH3ChainSegmentSave:
         return float("NaN")
 
     def save(self, state, images, sampled_latent, audio=None, prompt=None,
-             extra_pnginfo=None):
+             extra_pnginfo=None, delivery_images=None, show_preview=False):
         if _st_save is None:
             raise RuntimeError("safetensors is required for H3 chain checkpoints.")
         plan = state["plan"]
@@ -2528,6 +2533,8 @@ class MiniMaxH3ChainSegmentSave:
         shot = plan["shots"][index - 1]
         actual_frames = int(images.shape[0])
         expected_frames = int(shot["delivered_frames"])
+        if delivery_images is not None and int(delivery_images.shape[0]) != expected_frames:
+            raise ValueError("Refined delivery frames must match the planned trimmed scene length.")
         base_preview = bool(plan.get("base_preview", True))
         expected_images = (
             expected_frames if base_preview else
@@ -2611,7 +2618,7 @@ class MiniMaxH3ChainSegmentSave:
         paths = _artifact_paths(plan, index)
         encode_scene_preview = bool(plan.get(
             "base_preview", self._encode_scene_preview(prompt)
-        ))
+        )) or delivery_images is not None
         if encode_scene_preview:
             os.makedirs(os.path.dirname(paths["segment"]), exist_ok=True)
         os.makedirs(os.path.dirname(paths["checkpoint"]), exist_ok=True)
@@ -2647,8 +2654,16 @@ class MiniMaxH3ChainSegmentSave:
             })
             if published_segment is not None:
                 _write_segment_video(
-                    images, published_segment, FPS, plan["segment_crf"],
+                    delivery_images if delivery_images is not None else images,
+                    published_segment, FPS, plan["segment_crf"],
                     metadata=video_metadata)
+                if show_preview and audio is not None:
+                    muxed_segment = published_segment + ".muxed.mp4"
+                    try:
+                        _pyav_mux_audio(published_segment, audio, muxed_segment, 256, expected_frames)
+                        os.replace(muxed_segment, published_segment)
+                    finally:
+                        _safe_unlink(muxed_segment)
             _atomic_text(published_prompt, shot["prompt"])
             _st_save(tensors, checkpoint_tmp, metadata={
                 "format": "h3_chain_checkpoint_v3",
@@ -2683,6 +2698,8 @@ class MiniMaxH3ChainSegmentSave:
             if published_segment is not None:
                 segment["segment"] = _relative_output_path(published_segment)
                 segment["segment_sha256"] = _file_sha256(published_segment)
+                if show_preview and audio is not None:
+                    segment["embedded_audio"] = True
             metadata = {
                 "format": "h3_chain_segment_v3",
                 "run_name": plan["run_name"],
@@ -2719,7 +2736,10 @@ class MiniMaxH3ChainSegmentSave:
                       (index, len(plan["shots"]), published_segment,
                        published_checkpoint))
         _LOG.info("H3 Chain %s", status)
-        return {"ui": {"text": [status]}, "result": (segment, status)}
+        ui = {"text": [status]}
+        if show_preview and published_segment is not None:
+            ui["videos"] = [_video_output_item(published_segment)]
+        return {"ui": ui, "result": (segment, status)}
 
 
 def _review_video(plan: dict[str, Any], segment: dict[str, Any],
@@ -3624,9 +3644,9 @@ def _validate_prelude(manifest: dict[str, Any]) -> dict[str, Any] | None:
         raise ValueError(
             "H3 chain prelude must contain at least one frame at %d fps." % FPS)
     compatibility = manifest.get("compatibility") or {}
-    if (int(value.get("width", 0)) != int(compatibility.get("width", 0)) or
+    if (int(value.get("width", 0)) != int(compatibility.get("delivery_width", compatibility.get("width", 0))) or
             int(value.get("height", 0)) !=
-            int(compatibility.get("height", 0))):
+            int(compatibility.get("delivery_height", compatibility.get("height", 0)))):
         raise ValueError(
             "H3 chain prelude dimensions do not match generated segments.")
     video_value = value.get("video")

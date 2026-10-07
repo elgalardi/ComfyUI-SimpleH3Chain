@@ -4,6 +4,7 @@ import {api} from "/scripts/api.js";
 const NODE_NAMES = new Set([
     "SimpleH3DirectEditPreview",
     "SimpleH3ChainAssemble",
+    "SimpleH3ChainSegmentSave",
 ]);
 const mounted = new Set();
 let pollTimer = null;
@@ -191,6 +192,8 @@ function updatePolling() {
 }
 
 function mount(node) {
+    if (nodeType(node) === "SimpleH3ChainSegmentSave" &&
+        node.widgets?.find((widget) => widget.name === "show_preview")?.value !== true) return;
     if (!node || node._simpleH3Mounted) return;
     node._simpleH3Mounted = true;
 
@@ -270,6 +273,8 @@ function mount(node) {
             ? "Waiting for a refined window"
             : nodeType(node) === "SimpleH3DirectEditPreview"
                 ? "Waiting for one-pass edit preview"
+                : nodeType(node) === "SimpleH3ChainSegmentSave"
+                    ? "Waiting for the saved refined scene"
                 : "Waiting for the accumulated base preview";
     }
 
@@ -285,6 +290,8 @@ function mount(node) {
         ? "Each refined window appears here; the complete video replaces the last one."
         : nodeType(node) === "SimpleH3DirectEditPreview"
             ? "The complete one-pass H3 edit appears here with its original source audio."
+        : nodeType(node) === "SimpleH3ChainSegmentSave"
+            ? "Shows the saved refined scene directly, without a duplicate video encode."
         : automatic
             ? "The accumulated base video grows scene by scene; the final replaces it."
             : "The player will receive each saved scene automatically.";
