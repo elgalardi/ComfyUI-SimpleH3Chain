@@ -25,6 +25,12 @@ No global memory-manager patches or permanent model caches are installed.
 Restart ComfyUI to register the new nodes. No existing workflows are rewritten.
 CPU contract tests mock sampling; they do not measure GPU speed or image quality.
 
+The node progress bar accumulates all temporal chunks, spatial tiles and sampling
+steps instead of restarting per tile. It reserves progress for upscale and stitching
+and reaches 100% only when outputs are ready. This measures work stages, not elapsed
+time or an ETA; model initialization and learned upscale can hold the bar still.
+Native latent previews remain enabled according to ComfyUI's preview setting.
+
 ## Protected refined scene continuity
 
 Connect Current Scene `state` to Ultimate Upscale's optional `state` input in a

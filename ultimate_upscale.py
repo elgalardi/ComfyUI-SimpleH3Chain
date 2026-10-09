@@ -1033,7 +1033,43 @@ class _PreparedNoise:
         return self._noise
 
 
-def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg):
+class _UpscaleProgress:
+    """One node bar; sampling callbacks never restart it for a tile."""
+
+    def __init__(self, chunks):
+        self.bar = comfy.utils.ProgressBar(chunks * 1000)
+        self.chunk = 0
+        self.completed = 0
+        self.steps = 1
+        self.value = 0
+        self.bar.update_absolute(0)
+
+    def start_chunk(self, index):
+        self.chunk = index
+        self.completed = 0
+
+    def sampling(self, steps):
+        self.steps = max(1, steps)
+        self.update(0)
+
+    def update(self, step, preview=None):
+        value = self.chunk * 1000 + 100 + int(850 * min(self.steps, self.completed + step) / self.steps)
+        self.value = max(self.value, value)
+        self.bar.update_absolute(self.value, preview=preview)
+
+    def advance(self, steps):
+        self.completed += steps
+        self.update(0)
+
+    def finish_chunk(self):
+        self.value = (self.chunk + 1) * 1000 - 1
+        self.bar.update_absolute(self.value)
+
+    def finish(self):
+        self.bar.update_absolute(self.bar.total)
+
+
+def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg, progress=None):
     """Sample one piece (full chunk or tile). Mirrors SamplerCustomAdvanced,
     including the x0 preview callback. Returns nested samples (video+audio)."""
     latent = dict(piece)
@@ -1048,7 +1084,19 @@ def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg):
 
     guider = build_guider(model, cond, negative, cfg)
     x0_output = {}
-    callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+    steps = sigmas.shape[-1] - 1
+    if progress is None:
+        callback = latent_preview.prepare_callback(guider.model_patcher, steps, x0_output)
+    else:
+        previewer = latent_preview.get_previewer(
+            guider.model_patcher.load_device, guider.model_patcher.model.latent_format)
+
+        def callback(step, x0, x, total_steps):
+            preview = None
+            if previewer:
+                preview_latent = x0.tensors[0] if x0.is_nested else x0
+                preview = previewer.decode_latent_to_preview_image("JPEG", preview_latent)
+            progress.update(min(step + 1, steps), preview)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     samples = guider.sample(
         noise.generate_noise(latent), latent_image, sampler, sigmas,
@@ -1056,6 +1104,8 @@ def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg):
         disable_pbar=disable_pbar, seed=noise.seed,
     )
     samples = samples.to(comfy.model_management.intermediate_device())
+    if progress is not None:
+        progress.advance(steps)
     return samples
 
 
@@ -1148,7 +1198,7 @@ class _ZeroNoise:
 
 
 def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
-                          sigmas, negative, cfg, video_mask=None):
+                          sigmas, negative, cfg, video_mask=None, progress=None):
     """Tiles that are stepped TOGETHER instead of finished one at a time.
 
     WHY THIS EXISTS.
@@ -1204,6 +1254,8 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
             ", ".join("%dpx" % v for v in sorted(set(odd))))
 
     nrows, ncols = len(rows), len(cols)
+    if progress is not None:
+        progress.sampling(nrows * ncols * (len(sigmas) - 1))
     ta = chunk_a.shape[-1]
     dev, dt = chunk_v.device, chunk_v.dtype
     seed = getattr(noise, "seed", 0)
@@ -1263,7 +1315,7 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
             else:
                 n = zero
             out = sample_piece(piece, td["cond"], model, n, sampler, two,
-                               negative, cfg)
+                               negative, cfg, progress)
             ot = out.tensors[0].to(device=dev, dtype=torch.float32)
             if video_mask is not None:
                 ot = torch.where(mv == 0, xt.to(dtype=torch.float32), ot)
@@ -1281,7 +1333,7 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
 
 
 def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, negative, cfg,
-                    video_mask=None):
+                    video_mask=None, progress=None):
     """Inner loop: spatial split -> per-tile sampling -> spatial stitch.
     Mirrors the spatial split/extract/append trio. Audio is carried unchanged
     (frozen in every tile, never re-sampled). Returns (reassembled_video, info)."""
@@ -1324,6 +1376,8 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
             "(all multiples of 32), or use a different grid_rows/grid_cols."
             % ", ".join("%dpx" % v for v in sorted(set(_odd))))
     nrows, ncols = len(rows), len(cols)
+    if progress is not None:
+        progress.sampling(nrows * ncols * (len(sigmas) - 1))
     ta = chunk_a.shape[-1]
 
     acc_v = chunk_v.clone()
@@ -1384,7 +1438,7 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                 _nv = _tiled_noise[0][:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
                 _n = _PreparedNoise(_seed, comfy.nested_tensor.NestedTensor(
                     (_nv, _tiled_noise[1])))
-            out = sample_piece(piece, cond_tile, model, _n, sampler, sigmas, negative, cfg)
+            out = sample_piece(piece, cond_tile, model, _n, sampler, sigmas, negative, cfg, progress)
             tile_v = out.tensors[0]
             if video_mask is not None:
                 locked = video_mask[:, :, :, r0:r0 + tr, c0:c0 + tc] == 0
@@ -1857,8 +1911,10 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
         segments_debug = []
         tiles_debug = []
         upscale_models = {}
+        progress = _UpscaleProgress(len(bounds))
 
         for i, (k0, f0, k1, f1) in enumerate(bounds):
+            progress.start_chunk(i)
             chunk_v = video[:, :, k0:k1].contiguous()
             a0, a1 = audio_range(f0, f1)
             a1 = min(a1, ta)
@@ -1909,6 +1965,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                     chunk_v, chunk_a, cond_i, spatial_split_param,
                     model, noise, sampler, sigmas, negative, cfg,
                     video_mask=chunk_mask,
+                    progress=progress,
                 )
                 tile_info = dict(tile_info)
                 tile_info["chunk"] = i
@@ -1918,7 +1975,8 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                 if chunk_mask is not None:
                     piece["noise_mask"] = comfy.nested_tensor.NestedTensor((
                         chunk_mask, torch.zeros_like(chunk_a)))
-                out = sample_piece(piece, cond_i, model, noise, sampler, sigmas, negative, cfg)
+                progress.sampling(len(sigmas) - 1)
+                out = sample_piece(piece, cond_i, model, noise, sampler, sigmas, negative, cfg, progress)
                 chunk_out_v = out.tensors[0]
             if chunk_mask is not None:
                 chunk_out_v = torch.where(chunk_mask == 0, chunk_v, chunk_out_v)
@@ -1939,6 +1997,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                 "spatial_w": chunk_v.shape[4],
                 "protected_video_tokens": locked,
             })
+            progress.finish_chunk()
 
         # all chunks sampled & stitched: the diffusion model is no longer needed,
         # unload it so the caller (e.g. VAE decode of the large latent) gets the VRAM
@@ -1954,4 +2013,5 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
             audio_tokens = min(round(context_frames * FRAME_RESCALE), int(acc_a.shape[-1]))
             context["_simple_h3_refined_latent"] = {"samples": comfy.nested_tensor.NestedTensor((
                 acc_v[:, :, -tail_tokens:].clone(), acc_a[..., -audio_tokens:].clone()))}
+        progress.finish()
         return io.NodeOutput(out, segments_debug, tiles_debug, context)

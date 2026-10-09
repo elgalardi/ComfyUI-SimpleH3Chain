@@ -15,6 +15,72 @@ spec.loader.exec_module(up)
 
 
 class UpscaleTests(unittest.TestCase):
+    def test_progress_accumulates_chunks_tiles_and_sampler_steps(self):
+        latent = {'samples': up.comfy.nested_tensor.NestedTensor((
+            up.torch.zeros(1, 24, 72, 8, 8), up.torch.zeros(1, 32, 2, 405)))}
+        spatial = dict(tile_width=96, tile_height=96, tile_size_mode='rows_cols',
+                       grid_rows=2, grid_cols=2, spatial_w_overlap=32, spatial_h_overlap=32,
+                       min_tile_size=32, fade_width=32, fade_height=32,
+                       overlap_mode='earlier', overlap_blend='smoothstep')
+
+        def sample(piece, cond, model, noise, sampler, sigmas, negative, cfg, progress):
+            steps = len(sigmas) - 1
+            for step in range(steps):
+                progress.update(step + 1)
+            progress.advance(steps)
+            return piece['samples']
+
+        for joint in (True, False, None):
+            values = []
+            def make_bar(total):
+                return SimpleNamespace(total=total,
+                    update_absolute=lambda value, **kwargs: values.append(value))
+            with self.subTest(joint=joint), \
+                 patch.object(up.comfy.utils, 'ProgressBar', side_effect=make_bar) as bars, \
+                 patch.object(up, 'sample_piece', side_effect=sample):
+                result = up.SimpleH3UltimateUpscale.execute(
+                    latent=latent, conditioning=[], model=SimpleNamespace(),
+                    noise=SimpleNamespace(seed=0), sampler=None,
+                    sigmas=up.torch.tensor([1., .5, 0.]),
+                    temporal_split_param={'chunk_length': 119, 'temporal_overlap': 17, 'anchor_strength': .999},
+                    spatial_split_param=None if joint is None else dict(spatial, joint_steps=joint))
+            bars.assert_called_once()
+            total = bars.call_args.args[0]
+            self.assertEqual(total, len(result.result[1]) * 1000)
+            self.assertEqual(values, sorted(values))
+            self.assertEqual(values[0], 0)
+            self.assertEqual(values[-1], total)
+            self.assertTrue(all(value < total for value in values[:-1]))
+
+    def test_sampler_callback_uses_shared_bar_and_preserves_preview(self):
+        video = up.torch.zeros(1, 24, 1, 2, 2)
+        audio = up.torch.zeros(1, 32, 2, 2)
+        samples = up.comfy.nested_tensor.NestedTensor((video, audio))
+        progress = Mock()
+        previewer = Mock()
+        previewer.decode_latent_to_preview_image.return_value = ('JPEG', 'preview', 512)
+        guider = SimpleNamespace(model_patcher=SimpleNamespace(
+            load_device='cpu', model=SimpleNamespace(latent_format=object())))
+
+        def sample(*args, **kwargs):
+            for step in range(2):
+                kwargs['callback'](step, samples, samples, 2)
+            return samples
+
+        guider.sample = sample
+        with patch.object(up, 'build_guider', return_value=guider), \
+             patch.object(up.comfy.sample, 'fix_empty_latent_channels', side_effect=lambda model, value, *args: value), \
+             patch.object(up.latent_preview, 'get_previewer', return_value=previewer), \
+             patch.object(up.latent_preview, 'prepare_callback') as local_callback:
+            up.sample_piece({'samples': samples}, [], None,
+                SimpleNamespace(seed=0, generate_noise=lambda latent: samples), None,
+                up.torch.tensor([1., .5, 0.]), None, 1., progress)
+        local_callback.assert_not_called()
+        self.assertEqual([call.args[0] for call in progress.update.call_args_list], [1, 2])
+        self.assertEqual(progress.update.call_args.args[1], ('JPEG', 'preview', 512))
+        progress.advance.assert_called_once_with(2)
+        self.assertEqual(previewer.decode_latent_to_preview_image.call_args.args[0], 'JPEG')
+
     def test_schema(self):
         schema = up.SimpleH3UltimateUpscale.define_schema()
         self.assertEqual(schema.node_id, 'SimpleH3UltimateUpscale')
