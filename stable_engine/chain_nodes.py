@@ -224,7 +224,7 @@ def _history_contract(plan: dict[str, Any], through_index: int) -> dict[str, Any
     for shot in plan["shots"][:int(through_index)]:
         shots.append({
             "id": shot["id"],
-            "prompt_hash": shot["prompt_hash"],
+            "prompt_hash": shot.get("history_prompt_hash", shot["prompt_hash"]),
             "seed": shot["seed"],
             "steps": shot["steps"],
             "raw_frames": shot["raw_frames"],
@@ -867,7 +867,7 @@ def _normalize_plan(
         shots.append(shot)
         stitched_frames += delivered_frames
 
-    if bool(compensate_final_overlap_loss) and len(shots) > 1:
+    if bool(compensate_final_overlap_loss) and len(shots) > 1 and raw.get("source_timeline") != "masked_av":
         # Masked AV intentionally treats each requested H3 length as a raw
         # sampler length, so every continuation contributes context_length
         # fewer delivered frames. Recover the complete requested timeline only

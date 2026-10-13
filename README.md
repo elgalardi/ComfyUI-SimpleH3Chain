@@ -96,3 +96,57 @@ not another installed node pack. See THIRD_PARTY_NOTICES.md and LICENSE.
 
 Offline frame-routing checks: `python -B tests/test_frame_gate.py`.
 These checks do not load models or execute ComfyUI generations.
+# Source-video editing in exact blocks
+
+`Source Video — Metadata Only Plan` removes the initial one-frame loader entirely.
+Select the input file in the single VHS Upload loader inside the loop, with cap/skip
+connected to VHS Block Parameters. The plan resolves that chain's selection from the
+submitted graph and reads duration/dimensions with FFprobe only. Its width/height
+outputs preserve the former canvas pixel budget and 32-pixel rounding; no frames
+are decoded for sizing. The workflow's `simple_h3_full_source_preview` property makes
+this VHS node preview the full source, independently of generation cap/skip. It only
+changes browser-preview parameters, not loader inputs or generated frame counts.
+
+For VHS loading, select the input file directly in `VHS Load Video (Upload)`.
+This initial loader uses `frame_load_cap=1` for canvas sizing; connect its `video_info`
+directly to `Source Video — VHS Block Plan`. The plan reads the upstream Upload
+selection from the submitted graph and outputs `video_path`; connect that output to
+`VHS Load Video (Path)` inside the loop. No pasted path or second selection is needed.
+The plan uses the full source duration, capped by `max_seconds`.
+Inside the loop, Current's state feeds `VHS Block Parameters`; connect
+its outputs to the second loader's `frame_load_cap` and `skip_first_frames`.
+Send that loader's IMAGE and the same state to `Prepare Loaded Block`, then route its
+real frames to Driven and its H3-padded frames to the VAE. Both VHS loaders must use
+`force_rate=24`, `select_every_nth=1`, `format=None`, with no VAE or Meta Batch attached.
+The final block loads only the remaining real frames. VHS/OpenCV traverses skipped
+frames, so later blocks can take longer than the seek-based file loader below.
+
+For continuous source edits choose `masked_av` / audio `match_video` in Context.
+VHS Block Plan automatically follows its connected chain's Context mode, even if
+its standalone `masked_av` fallback widget is stale. Each continuation generates an extra
+39-frame protected AV prefix without moving the source block boundaries. Prepare
+Loaded Block adds a placeholder prefix that Context replaces with the previous
+generated latent; Driven still sees only the new source window. Delivery trims the
+repeated head and H3-grid tail, retaining the exact source duration. This explicit
+source timeline disables final-scene overlap compensation. Keep the protected-HQ
+upscale state/checkpoint connections and start a new output project after changing
+context mode. AV context helps continuity but does not guarantee identical music
+or voices across generations.
+
+Continuous source blocks pass the first and previous accepted generation prompts
+to the director as continuity memory, including when resuming from saved segments.
+Established appearance and audio remain the reference contract; current source
+frames guide new actions and visible transitions. This adds no extra LLM call.
+
+For file-based input use `Source Video — File Block Plan` and `Source Video — Load Current File Block`.
+The plan probes metadata and decodes just one canvas frame, not the whole video. Connect its `source`
+output to the file-block node and Current's state to that node inside the loop. Each iteration seeks
+to its start time and decodes only its own window at 24 fps. FFmpeg/FFprobe must be on PATH.
+Use an absolute local video path; `max_seconds=0` plans the full file, otherwise it limits the planned
+duration without loading that many frames up front. Short final blocks retain their source duration.
+File identity uses resolved path, size and modification timestamp, not a decoded-frame hash.
+The uploaded/decoded IMAGE-batch nodes below remain available, but do not avoid full-video decoding.
+
+`Source Video — Block Plan` partitions a decoded **24 fps** IMAGE batch into exact source windows (default: 10 seconds). `Source Video — Current Block` sends only the current real window to Driven and a tail-padded, H3-valid version of that same window to the VAE. Use `source_control_cut` with audio context off; this source-timeline path does not add the 39-frame extension overlap. Delivery Trim removes the grid-padding tail, including on a short final block.
+
+Run the director inside the loop with Scenes=1, Hold=false and Cut=false. `Source Block — Director Prompt` extracts its one scene prompt and records the actual text in checkpoint state. The original request identifies the resumable plan; saved prompt/media/checkpoint artifacts retain their integrity checks. Source content fingerprints distinguish videos with identical dimensions and frame counts. Each block executes its own director analysis/generation, so API usage grows with block count. Generated audio remains supported; copying the source soundtrack is a separate workflow choice.
