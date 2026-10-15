@@ -85,6 +85,9 @@ class TwoPassTests(unittest.TestCase):
         protected = cls().build(**args, delivery_width=832, delivery_height=448, prompt=prompt)[0]
         self.assertIn(':refined_prefix=v1', protected['plan_hash'])
         self.assertNotEqual(protected['plan_hash'], new['plan_hash'])
+        prompt['235']['class_type'] = 'SimpleH3UltimateUpscaleAdvanced'
+        advanced = cls().build(**args, delivery_width=832, delivery_height=448, prompt=prompt)[0]
+        self.assertEqual(advanced['plan_hash'], protected['plan_hash'])
 
     def test_existing_video_preserves_base_tail_and_plan(self):
         calls = []

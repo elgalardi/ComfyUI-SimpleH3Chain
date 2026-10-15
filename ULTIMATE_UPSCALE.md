@@ -31,6 +31,32 @@ and reaches 100% only when outputs are ready. This measures work stages, not ela
 time or an ETA; model initialization and learned upscale can hold the bar still.
 Native latent previews remain enabled according to ComfyUI's preview setting.
 
+## Advanced sampling controls
+
+`Simple H3 Ultimate Upscale — Advanced` is a separate node; the original node's
+schema and wired noise/sampler/sigmas inputs are unchanged. Advanced replaces
+those three wires with `noise_seed`, `add_noise`, `steps`, `sampler_name`,
+`scheduler`, `cfg`, `start_at_step`, `end_at_step` and `return_with_leftover_noise`.
+Reconnect model, conditioning, latent, optional negative, parameter nodes and
+state as before. Output indices, audio preservation and protected HQ prefix are
+the same. CFG requires negative conditioning, as in the original upscale node.
+
+The native KSampler builds the full schedule, including sampler-specific sigma
+handling. Start/end select an interval in that schedule, not a denoise fraction.
+Defaults are 8 total steps, start 6, end 10000 (the schedule's end), LCM/beta,
+CFG 1, noise enabled and leftover noise disabled. These defaults are a test
+starting point, not an automatic conversion of the existing wired sigma recipe.
+For comparison, keep total steps fixed and change only start, e.g. 5, 6, 7.
+An empty interval performs upscale/prefix protection but no sampling.
+
+With leftover noise disabled, an early end is forced to sigma zero, like
+KSampler Advanced. Enable preserves the selected ending sigma: the result and
+saved HQ tail can still be noisy, so disable it for final decode/continuation.
+Noise disable is honored in full-frame, joint tiled and sequential tiled paths.
+Existing joint tiling still samples each sigma pair separately; multistep solver
+history does not span those calls. Use no spatial split or `joint_steps=false`
+when testing a sampler's complete trajectory. No GPU quality benchmark is implied.
+
 ## Protected refined scene continuity
 
 Connect Current Scene `state` to Ultimate Upscale's optional `state` input in a

@@ -15,6 +15,85 @@ spec.loader.exec_module(up)
 
 
 class UpscaleTests(unittest.TestCase):
+    def test_advanced_schema_keeps_original_sockets_and_outputs(self):
+        original = up.SimpleH3UltimateUpscale.define_schema()
+        advanced = up.SimpleH3UltimateUpscaleAdvanced.define_schema()
+        self.assertEqual(advanced.node_id, 'SimpleH3UltimateUpscaleAdvanced')
+        ids = {i.id for i in advanced.inputs}
+        self.assertTrue({'steps', 'cfg', 'sampler_name', 'scheduler', 'noise_seed',
+            'start_at_step', 'end_at_step', 'add_noise', 'return_with_leftover_noise',
+            'state', 'latent_upscale_param', 'spatial_split_param', 'temporal_split_param'} <= ids)
+        self.assertFalse({'noise', 'sampler', 'sigmas'} & ids)
+        self.assertEqual([o.id for o in original.outputs], [o.id for o in advanced.outputs])
+        self.assertEqual(original.node_id, 'SimpleH3UltimateUpscale')
+
+    def test_advanced_selects_native_schedule_range_and_noise(self):
+        full = up.torch.tensor([1., .9, .8, .7, .6, .5, .4, .3, 0.])
+        for start, end, leftover, expected in (
+            (2, 6, 'disable', [.8, .7, .6, .5, 0.]),
+            (2, 6, 'enable', [.8, .7, .6, .5, .4]),
+            (6, 10000, 'disable', [.4, .3, 0.]),
+            (9, 10000, 'disable', [0.]),
+            (7, 3, 'enable', [.7]),
+            (0, 0, 'disable', [0.]),
+        ):
+            for add_noise in ('enable', 'disable'):
+                with self.subTest(start=start, end=end, leftover=leftover, noise=add_noise), \
+                     patch.object(up.comfy.samplers, 'KSampler', return_value=SimpleNamespace(sigmas=full)) as schedule, \
+                     patch.object(up.comfy.samplers, 'sampler_object', return_value='sampler') as sampler, \
+                     patch.object(up.SimpleH3UltimateUpscale, 'execute', return_value='result') as run:
+                    model = object()
+                    result = up.SimpleH3UltimateUpscaleAdvanced.execute(
+                        latent='latent', conditioning='positive', model=model,
+                        add_noise=add_noise, noise_seed=123, steps=8, cfg=2.5,
+                        sampler_name='dpm_2', scheduler='karras', start_at_step=start,
+                        end_at_step=end, return_with_leftover_noise=leftover,
+                        negative='negative', state='state', latent_upscale_param='upscale',
+                        temporal_split_param='temporal', spatial_split_param='spatial',
+                        keep_model_loaded=False)
+                    self.assertEqual(result, 'result')
+                    schedule.assert_called_once_with(model, 8, device='cpu', sampler='dpm_2', scheduler='karras', denoise=1.0)
+                    sampler.assert_called_once_with('dpm_2')
+                    args = run.call_args.kwargs
+                    up.torch.testing.assert_close(args['sigmas'], up.torch.tensor(expected))
+                    self.assertEqual(args['noise'].seed, 123)
+                    self.assertIsInstance(args['noise'], up.Noise_RandomNoise if add_noise == 'enable' else up._ZeroNoise)
+                    self.assertEqual(args['cfg'], 2.5)
+                    self.assertEqual(args['negative'], 'negative')
+                    self.assertEqual(args['state'], 'state')
+                    self.assertEqual(args['latent_upscale_param'], 'upscale')
+                    self.assertEqual(args['temporal_split_param'], 'temporal')
+                    self.assertEqual(args['spatial_split_param'], 'spatial')
+                    self.assertFalse(args['keep_model_loaded'])
+        up.torch.testing.assert_close(full, up.torch.tensor([1., .9, .8, .7, .6, .5, .4, .3, 0.]))
+
+    def test_disabled_noise_is_honored_by_both_spatial_paths(self):
+        video = up.torch.zeros(1, 24, 2, 4, 4)
+        audio = up.torch.zeros(1, 32, 2, 10)
+        spatial = dict(tile_width=64, tile_height=64, tile_size_mode='rows_cols',
+            grid_rows=1, grid_cols=1, spatial_w_overlap=0, spatial_h_overlap=0,
+            min_tile_size=32, fade_width=32, fade_height=32,
+            overlap_mode='earlier', overlap_blend='smoothstep')
+        calls = []
+        def sample(piece, cond, model, noise, *args):
+            calls.append(noise.generate_noise(piece))
+            return piece['samples']
+        for process in (up.spatial_process, up.spatial_process_joint):
+            with self.subTest(process=process.__name__), \
+                 patch.object(up, 'sample_piece', side_effect=sample), \
+                 patch.object(up.comfy.sample, 'prepare_noise', side_effect=AssertionError('random noise requested')):
+                process(video, audio, [], spatial, None, up._ZeroNoise(123), None,
+                    up.torch.tensor([.5, .25, 0.]), None, 1.)
+        self.assertTrue(calls)
+        self.assertTrue(all(up.torch.count_nonzero(t).item() == 0 for n in calls for t in n.tensors))
+
+    def test_empty_step_range_does_not_load_sampler(self):
+        piece = {'samples': object()}
+        with patch.object(up, 'build_guider') as guider:
+            output = up.sample_piece(piece, [], None, None, None, up.torch.tensor([0.]), None, 1.)
+        self.assertIs(output, piece['samples'])
+        guider.assert_not_called()
+
     def test_progress_accumulates_chunks_tiles_and_sampler_steps(self):
         latent = {'samples': up.comfy.nested_tensor.NestedTensor((
             up.torch.zeros(1, 24, 72, 8, 8), up.torch.zeros(1, 32, 2, 405)))}
@@ -40,7 +119,7 @@ class UpscaleTests(unittest.TestCase):
                  patch.object(up, 'sample_piece', side_effect=sample):
                 result = up.SimpleH3UltimateUpscale.execute(
                     latent=latent, conditioning=[], model=SimpleNamespace(),
-                    noise=SimpleNamespace(seed=0), sampler=None,
+                    noise=up.Noise_RandomNoise(0), sampler=None,
                     sigmas=up.torch.tensor([1., .5, 0.]),
                     temporal_split_param={'chunk_length': 119, 'temporal_overlap': 17, 'anchor_strength': .999},
                     spatial_split_param=None if joint is None else dict(spatial, joint_steps=joint))
@@ -131,15 +210,24 @@ class UpscaleTests(unittest.TestCase):
             v, a = piece['samples'].tensors
             return up.comfy.nested_tensor.NestedTensor((v + 0.125, a + 100))
 
-        for joint in (True, False, None):
-            with self.subTest(joint=joint), patch.object(up, 'sample_piece', side_effect=corrupt):
+        for joint, advanced in ((j, a) for j in (True, False, None) for a in (False, True)):
+            with self.subTest(joint=joint, advanced=advanced), \
+                 patch.object(up, 'sample_piece', side_effect=corrupt), \
+                 patch.object(up.comfy.samplers, 'KSampler', return_value=SimpleNamespace(sigmas=torch.tensor([1., .5, 0.]))):
                 params = None if joint is None else dict(spatial, joint_steps=joint)
-                result = up.SimpleH3UltimateUpscale.execute(
+                args = dict(
                     latent=latent, conditioning=[], model=SimpleNamespace(),
-                    noise=SimpleNamespace(seed=0), sampler=None, sigmas=torch.tensor([1., .5, 0.]),
                     latent_upscale_param={'method': 'bicubic', 'width': 128, 'height': 128},
                     temporal_split_param={'chunk_length': 119, 'temporal_overlap': 17, 'anchor_strength': .999},
                     spatial_split_param=params, state=state)
+                if advanced:
+                    result = up.SimpleH3UltimateUpscaleAdvanced.execute(**args,
+                        add_noise='disable', noise_seed=123, steps=2, cfg=1.,
+                        sampler_name='lcm', scheduler='beta', start_at_step=1, end_at_step=2,
+                        return_with_leftover_noise='disable')
+                else:
+                    result = up.SimpleH3UltimateUpscale.execute(**args,
+                        noise=up.Noise_RandomNoise(0), sampler=None, sigmas=torch.tensor([1., .5, 0.]))
                 output = result.result[0]['samples']
                 self.assertTrue(torch.equal(output.tensors[0][:, :, :12], previous))
                 self.assertTrue(torch.equal(output.tensors[1], audio))

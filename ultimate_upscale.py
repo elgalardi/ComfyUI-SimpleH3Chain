@@ -44,6 +44,7 @@ import comfy.utils
 import folder_paths
 import latent_preview
 from comfy_api.latest import io
+from comfy_extras.nodes_custom_sampler import Noise_RandomNoise
 
 try:
     from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
@@ -1072,6 +1073,8 @@ class _UpscaleProgress:
 def sample_piece(piece, cond, model, noise, sampler, sigmas, negative, cfg, progress=None):
     """Sample one piece (full chunk or tile). Mirrors SamplerCustomAdvanced,
     including the x0 preview callback. Returns nested samples (video+audio)."""
+    if len(sigmas) < 2:
+        return piece["samples"]
     latent = dict(piece)
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(
@@ -1263,8 +1266,8 @@ def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
     # ONE noise field for the chunk, sliced per tile - so the region two tiles
     # share starts from identical noise as well as identical latent.
     try:
-        base = comfy.sample.prepare_noise(
-            comfy.nested_tensor.NestedTensor((chunk_v, chunk_a)), seed)
+        base = noise.generate_noise({
+            "samples": comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))})
         nv_full, na_full = base.tensors[0], base.tensors[1]
     except Exception as e:
         raise RuntimeError("could not draw the chunk noise field: %s" % e)
@@ -1397,7 +1400,7 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
     _tiled_noise = None
     try:
         _full = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
-        _base = comfy.sample.prepare_noise(_full, _seed)
+        _base = noise.generate_noise({"samples": _full})
         _tiled_noise = (_base.tensors[0], _base.tensors[1])
     except Exception as _e:
         # Never fail the render over this: fall back to per-tile noise, which
@@ -2015,3 +2018,55 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                 acc_v[:, :, -tail_tokens:].clone(), acc_a[..., -audio_tokens:].clone()))}
         progress.finish()
         return io.NodeOutput(out, segments_debug, tiles_debug, context)
+
+
+class SimpleH3UltimateUpscaleAdvanced(SimpleH3UltimateUpscale):
+    @classmethod
+    def define_schema(cls):
+        schema = super().define_schema()
+        schema.node_id = "SimpleH3UltimateUpscaleAdvanced"
+        schema.display_name = "Simple H3 Ultimate Upscale — Advanced"
+        schema.description = (
+            "Protected previous-HQ upscale with KSampler Advanced-style controls. "
+            "Steps defines the full schedule; start/end select its refinement interval. "
+            "Audio stays unchanged. Leftover noise is experimental for HQ continuation: "
+            "use disable for a finished decode and clean saved context."
+        )
+        schema.search_aliases = ["h3 upscale advanced", "protected HQ advanced"]
+        schema.inputs = [i for i in schema.inputs if i.id not in ("noise", "sampler", "sigmas", "cfg")]
+        schema.inputs[3:3] = [
+            io.Combo.Input("add_noise", options=["enable", "disable"], default="enable"),
+            io.Int.Input("noise_seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True),
+            io.Int.Input("steps", default=8, min=1, max=10000),
+            io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1, round=0.01),
+            io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="lcm"),
+            io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="beta"),
+            io.Int.Input("start_at_step", default=6, min=0, max=10000,
+                         tooltip="Start index in the full schedule. At or beyond end: upscale/protect only, no sampling."),
+            io.Int.Input("end_at_step", default=10000, min=0, max=10000),
+            io.Combo.Input("return_with_leftover_noise", options=["disable", "enable"], default="disable",
+                           tooltip="Disable forces the selected interval to finish at sigma zero. Enable retains its ending sigma."),
+        ]
+        return schema
+
+    @classmethod
+    def execute(cls, latent, conditioning, model, add_noise, noise_seed, steps, cfg,
+                sampler_name, scheduler, start_at_step, end_at_step,
+                return_with_leftover_noise, negative=None, temporal_split_param=None,
+                spatial_split_param=None, latent_upscale_param=None,
+                keep_model_loaded=True, state=None) -> io.NodeOutput:
+        schedule = comfy.samplers.KSampler(
+            model, steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=1.0)
+        sigmas = schedule.sigmas.clone()
+        if end_at_step < len(sigmas) - 1:
+            sigmas = sigmas[:end_at_step + 1]
+            if return_with_leftover_noise == "disable":
+                sigmas[-1] = 0
+        sigmas = sigmas[min(start_at_step, len(sigmas) - 1):]
+        noise = Noise_RandomNoise(noise_seed) if add_noise == "enable" else _ZeroNoise(noise_seed)
+        return super().execute(
+            latent=latent, conditioning=conditioning, model=model, noise=noise,
+            sampler=comfy.samplers.sampler_object(sampler_name), sigmas=sigmas,
+            negative=negative, cfg=cfg, temporal_split_param=temporal_split_param,
+            spatial_split_param=spatial_split_param, latent_upscale_param=latent_upscale_param,
+            keep_model_loaded=keep_model_loaded, state=state)

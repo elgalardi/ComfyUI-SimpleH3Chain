@@ -214,7 +214,8 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
     @staticmethod
     def _has_refined_continuity(prompt):
         return isinstance(prompt, dict) and any(
-            isinstance(node, dict) and node.get("class_type") == "SimpleH3UltimateUpscale"
+            isinstance(node, dict) and node.get("class_type") in (
+                "SimpleH3UltimateUpscale", "SimpleH3UltimateUpscaleAdvanced")
             and node.get("inputs", {}).get("state") is not None
             for node in prompt.values())
 
@@ -1593,13 +1594,14 @@ class SimpleH3LatentUpscaleRefine:
 
 
 from .ultimate_upscale import (
-    SimpleH3UltimateUpscale, SimpleH3LatentUpscaleParams,
+    SimpleH3UltimateUpscale, SimpleH3UltimateUpscaleAdvanced, SimpleH3LatentUpscaleParams,
     SimpleH3LatentUpscaleWithModelParams, SimpleH3TemporalSplitParams,
     SimpleH3SpatialSplitParams,
 )
 
 NODE_CLASS_MAPPINGS = {
     "SimpleH3UltimateUpscale": SimpleH3UltimateUpscale,
+    "SimpleH3UltimateUpscaleAdvanced": SimpleH3UltimateUpscaleAdvanced,
     "SimpleH3LatentUpscaleParams": SimpleH3LatentUpscaleParams,
     "SimpleH3LatentUpscaleWithModelParams": SimpleH3LatentUpscaleWithModelParams,
     "SimpleH3TemporalSplitParams": SimpleH3TemporalSplitParams,
@@ -1626,6 +1628,7 @@ NODE_CLASS_MAPPINGS.update(_LONG_EDIT_NODE_CLASS_MAPPINGS)
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleH3UltimateUpscale": "Simple H3 Ultimate Upscale",
+    "SimpleH3UltimateUpscaleAdvanced": "Simple H3 Ultimate Upscale — Advanced",
     "SimpleH3LatentUpscaleParams": "Simple H3 Upscale Params — Interpolation",
     "SimpleH3LatentUpscaleWithModelParams": "Simple H3 Upscale Params — Learned Model",
     "SimpleH3TemporalSplitParams": "Simple H3 Upscale — Temporal Split",

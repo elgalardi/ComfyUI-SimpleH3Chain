@@ -4,7 +4,7 @@ Focused orchestration for the current Ref2VA, FL2VA and still-image workflows.
 Native MiniMax H3 model loading, conditioning, sampling and decoding remain
 unchanged. Context Loop does not need to be installed separately.
 
-## Included nodes (26)
+## Included nodes (27)
 
 - Scene chain: `SimpleH3ChainPlan`, `SimpleH3ChainLoopStart`,
   `SimpleH3ChainCurrent`, `SimpleH3ChainContext`, `SimpleH3LoopTrim`,
@@ -22,7 +22,7 @@ unchanged. Context Loop does not need to be installed separately.
   overwrite-only files under the output directory instead of the temp directory.
 - Optional model LoRA: `SimpleH3OptionalLoraLoader`.
 - Optional upscale: `SimpleH3LatentUpscaleResolution`, `SimpleH3LatentUpscaleRefine`.
-- Ultimate upscale: `SimpleH3UltimateUpscale`, `SimpleH3LatentUpscaleParams`,
+- Ultimate upscale: `SimpleH3UltimateUpscale`, `SimpleH3UltimateUpscaleAdvanced`, `SimpleH3LatentUpscaleParams`,
   `SimpleH3LatentUpscaleWithModelParams`, `SimpleH3TemporalSplitParams`,
   `SimpleH3SpatialSplitParams`. See [ULTIMATE_UPSCALE.md](ULTIMATE_UPSCALE.md)
   for the default `keep_model_loaded` behavior and memory tradeoffs.
