@@ -34,6 +34,10 @@ class SourceBlockTests(unittest.TestCase):
         self.assertIn('PREVIOUS ACCEPTED BLOCK:\nEnds standing beside the goal', request)
         self.assertIn('SOURCE BLOCK 3/3: 20.000..30.000s', request)
         self.assertIn('Keep subject_definitions consistent', request)
+        self.assertIn('design already chosen for active Direction Controls', request)
+        self.assertIn('Do not redesign that treatment per block', request)
+        self.assertIn('continue a selected orbit without restarting it', request)
+        self.assertIn('camera/setting outside explicit user or active Direction Control edits', request)
         state['index'] = 2
         second = nodes.SimpleH3SourceVideoLoadedBlock().prepare(torch.zeros(240, 1, 1, 3), state)[4]
         self.assertEqual(second.count('Established blue suit and red hair'), 1)

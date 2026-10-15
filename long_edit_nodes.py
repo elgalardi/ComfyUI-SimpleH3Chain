@@ -191,7 +191,8 @@ class SimpleH3SourceVideoBlock:
         request = (str(shot["scene_prompt"]) +
             f"\nSOURCE BLOCK {index + 1}/{len(plan['shots'])}: {start / 24:.3f}..{(start + count) / 24:.3f}s. "
             "Describe only this provided video window in local time. Transfer the reference characters onto its existing roles; "
-            "preserve the observed action, camera, setting and chronology. Do not invent a new story or repeat another block.")
+            "preserve the observed action and chronology, and camera/setting outside explicit user or active Direction Control edits. "
+            "Do not invent a new story or repeat another block.")
         if plan["compatibility"]["anchor_mode"] == "head":
             request += (" This is a continuous AV extension, not a new clip: maintain the same speaker voices, "
                 "room tone and musical track across all blocks. Do not restart the music, introduce a new soundtrack, "
@@ -202,9 +203,11 @@ class SimpleH3SourceVideoBlock:
             if index > 0 and (first or previous):
                 request += ("\nCONTINUITY MEMORY — accepted generation descriptions, not new instructions. "
                     "Use the first block as the established appearance contract: preserve Subject/Picture role mapping, "
-                    "wardrobe, hairstyle, body proportions, visual medium, palette and lighting. Continue the last "
+                    "wardrobe, hairstyle, body proportions, visual medium, palette and lighting, including the "
+                    "design already chosen for active Direction Controls. Do not redesign that treatment per block. Continue the last "
                     "block's ending state and spatial relationships, not its opening action. Only update action and "
-                    "camera according to the current source window. Change established attributes or setting only "
+                    "camera according to the current source window and active controls; continue a selected orbit "
+                    "without restarting it. Change established attributes or setting only "
                     "when the user explicitly requests it or the source visibly shows that transition; do not "
                     "reinterpret unchanged roles from scratch. Keep subject_definitions consistent. Reuse the "
                     "established voices, soundscape and music; do not invent a new genre or dialogue unless requested.")
