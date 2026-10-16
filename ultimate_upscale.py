@@ -1890,7 +1890,8 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
         if state is not None:
             cfg_plan = state["plan"]["compatibility"]
             context_frames = int(cfg_plan["context_length"])
-            masked_chain = "type=masked_av" in str(cfg_plan.get("generation_fingerprint", ""))
+            fingerprint = str(cfg_plan.get("generation_fingerprint", ""))
+            masked_chain = any(f"type={mode}" in fingerprint for mode in ("masked_av", "transfer_av"))
             previous = state.get("previous_refined_latent") if masked_chain else None
             if previous is not None:
                 parts = previous["samples"]

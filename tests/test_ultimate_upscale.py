@@ -210,8 +210,10 @@ class UpscaleTests(unittest.TestCase):
             v, a = piece['samples'].tensors
             return up.comfy.nested_tensor.NestedTensor((v + 0.125, a + 100))
 
-        for joint, advanced in ((j, a) for j in (True, False, None) for a in (False, True)):
-            with self.subTest(joint=joint, advanced=advanced), \
+        for mode, joint, advanced in ((m, j, a) for m in ('masked_av', 'transfer_av')
+                                      for j in (True, False, None) for a in (False, True)):
+            state['plan']['compatibility']['generation_fingerprint'] = 'type=' + mode
+            with self.subTest(mode=mode, joint=joint, advanced=advanced), \
                  patch.object(up, 'sample_piece', side_effect=corrupt), \
                  patch.object(up.comfy.samplers, 'KSampler', return_value=SimpleNamespace(sigmas=torch.tensor([1., .5, 0.]))):
                 params = None if joint is None else dict(spatial, joint_steps=joint)

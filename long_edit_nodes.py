@@ -13,23 +13,30 @@ import torch
 import folder_paths
 
 
-def _source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av=False):
+def _source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av=False, transfer_av=False):
     seconds = float(seconds_per_block)
     if total < 1 or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("Source video needs frames and a positive finite block duration.")
     prompt = str(request or "").strip() or "Adapt the character references onto the source performance; preserve its action, camera and chronology."
     block = max(1, round(seconds * 24))
+    masked_av = masked_av or transfer_av
     seed = int(seed) % (1 << 64)
     shots = []
-    for start in range(0, total, block):
+    start = 0
+    while start < total:
         delivered = min(block, total - start)
         prefix = 39 if masked_av and shots else 0
+        if transfer_av and total - start > block:
+            # End intermediate blocks on the native grid, not in duplicated tail padding.
+            aligned = max(56, 5 + 17 * round((delivered + prefix - 5) / 17))
+            delivered = min(total - start, aligned - prefix)
         raw = max(5, delivered + prefix)
         raw += (5 - raw % 17) % 17
         index = len(shots) + 1
         shots.append({"id": f"source_block_{index:03d}_{source_id}", "prompt": prompt,
             "length": raw, "delivered_frames": delivered, "audio_start_frame": start,
             "seed": (seed + index - 1) % (1 << 64), "steps": int(steps)})
+        start += delivered
     payload = {"summary": f"Source video: {total} frames, {len(shots)} chronological blocks at 24 fps.",
         "director_mode": "Continuous Story", "prompt_prefix": "", "shots": shots}
     if masked_av:
@@ -155,7 +162,9 @@ class SimpleH3SourceVideoBlock:
         index, shot, start, count, raw = window
         if start + count > int(images.shape[0]):
             raise ValueError("Source block does not match the loaded video. Rebuild its plan with the same source.")
-        return self._outputs(images[start:start + count].clone(), state, window)
+        prefix = min(39, start) if state["plan"]["compatibility"].get("transfer_av") else 0
+        source_prefix = images[start - prefix:start].clone() if prefix else None
+        return self._outputs(images[start:start + count].clone(), state, window, source_prefix)
 
     @staticmethod
     def _window(state):
@@ -177,14 +186,17 @@ class SimpleH3SourceVideoBlock:
         return index, shot, start, count, raw
 
     @staticmethod
-    def _outputs(frames, state, window):
+    def _outputs(frames, state, window, source_prefix=None):
         index, shot, start, count, raw = window
         plan = state["plan"]
         encoded = frames
         prefix = 39 if plan["compatibility"]["anchor_mode"] == "head" and index > 0 else 0
         if prefix:
-            # Context replaces this placeholder with the previous generated AV tail.
-            encoded = torch.cat((frames[:1].expand(prefix, -1, -1, -1), frames), dim=0)
+            # Context replaces source pre-roll (or the legacy placeholder) with the generated AV tail.
+            head = frames[:1].expand(prefix, -1, -1, -1) if source_prefix is None else source_prefix
+            if len(head) < prefix:
+                head = torch.cat((head[:1].expand(prefix - len(head), -1, -1, -1), head))
+            encoded = torch.cat((head, frames), dim=0)
         padding = raw - count - prefix
         if padding:
             encoded = torch.cat((encoded, frames[-1:].expand(padding, -1, -1, -1)), dim=0)
@@ -231,7 +243,10 @@ class SimpleH3SourceVideoFileBlock(SimpleH3SourceVideoBlock):
         index, shot, start, count, raw = window
         if not shot["id"].endswith("_" + source["signature"]) or start + count > source["frames"]:
             raise ValueError("Current block belongs to another source video plan.")
-        return self._outputs(_decode_video_window(source, start, count), state, window)
+        prefix = min(39, start) if state["plan"]["compatibility"].get("transfer_av") else 0
+        images = _decode_video_window(source, start - prefix, count + prefix)
+        return self._outputs(images[prefix:].clone() if prefix else images, state, window,
+                             images[:prefix].clone() if prefix else None)
 
 
 class SimpleH3SourceVideoVHSPlan(SimpleH3SourceVideoPlan):
@@ -267,7 +282,16 @@ class SimpleH3SourceVideoVHSPlan(SimpleH3SourceVideoPlan):
     @classmethod
     def IS_CHANGED(cls, video=None, prompt=None, unique_id=None, **kwargs):
         return (_video_signature(cls._selected_path(video, prompt, unique_id)),
-                cls._masked_context(prompt, unique_id, kwargs.get("masked_av", False)))
+                cls._masked_context(prompt, unique_id, kwargs.get("masked_av", False)),
+                cls._transfer_context(prompt, unique_id))
+
+    @staticmethod
+    def _transfer_context(prompt, unique_id):
+        return isinstance(prompt, dict) and unique_id is not None and any(
+            node.get("class_type") == "SimpleH3ChainContext"
+            and node.get("inputs", {}).get("context_type") == "transfer_av"
+            and SimpleH3SourceVideoVHSPlan._uses_source(prompt, node_id, unique_id)
+            for node_id, node in prompt.items())
 
     @staticmethod
     def _uses_source(prompt, node_id, source_id, visited=None):
@@ -291,7 +315,7 @@ class SimpleH3SourceVideoVHSPlan(SimpleH3SourceVideoPlan):
                  and SimpleH3SourceVideoVHSPlan._uses_source(prompt, node_id, unique_id)}
         if len(modes) > 1:
             raise ValueError("Source blocks need one Context mode per chain.")
-        return next(iter(modes)) == "masked_av" if modes else bool(fallback)
+        return next(iter(modes)) in ("masked_av", "transfer_av") if modes else bool(fallback)
 
     DESCRIPTION = "Plan from VHS source metadata, not its loaded frame count. Set VHS force_rate=24, select_every_nth=1 and format=None; the initial loader needs only one frame."
 
@@ -306,7 +330,8 @@ class SimpleH3SourceVideoVHSPlan(SimpleH3SourceVideoPlan):
         path = self._selected_path(video, prompt, unique_id)
         source_id = _video_signature(path)
         masked_av = self._masked_context(prompt, unique_id, masked_av)
-        return (*_source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av), str(path))
+        return (*_source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av,
+                              self._transfer_context(prompt, unique_id)), str(path))
 
 
 class SimpleH3SourceVideoVHSMetadataPlan(SimpleH3SourceVideoVHSPlan):
@@ -358,7 +383,8 @@ class SimpleH3SourceVideoVHSMetadataPlan(SimpleH3SourceVideoVHSPlan):
         width, height = (max(32, round(d * factor) // 32 * 32) for d in (width, height))
         masked_av = self._masked_context(prompt, unique_id, masked_av)
         plan = _source_plan(math.floor(duration * 24 + 1e-6), _video_signature(path), request,
-                            seconds_per_block, seed, steps, masked_av)
+                            seconds_per_block, seed, steps, masked_av,
+                            self._transfer_context(prompt, unique_id))
         return (*plan, width, height)
 
 
@@ -370,11 +396,12 @@ class SimpleH3SourceVideoVHSParams(SimpleH3SourceVideoBlock):
     RETURN_TYPES = ("INT", "INT")
     RETURN_NAMES = ("frame_load_cap", "skip_first_frames")
     FUNCTION = "parameters"
-    DESCRIPTION = "Connect both outputs to VHS Load Video inside the loop. Counts are real source frames at 24 fps, never H3 padding."
+    DESCRIPTION = "Connect both outputs to VHS Load Video inside the loop. transfer_av includes up to 39 real pre-roll frames; other modes load only the current window."
 
     def parameters(self, state):
         _, _, start, count, _ = self._window(state)
-        return count, start
+        prefix = min(39, start) if state["plan"]["compatibility"].get("transfer_av") else 0
+        return count + prefix, start - prefix
 
 
 class SimpleH3SourceVideoLoadedBlock(SimpleH3SourceVideoBlock):
@@ -384,9 +411,11 @@ class SimpleH3SourceVideoLoadedBlock(SimpleH3SourceVideoBlock):
     def prepare(self, images, state):
         window = self._window(state)
         count = window[3]
-        if int(images.shape[0]) != count:
-            raise ValueError(f"VHS loaded {int(images.shape[0])} frames; current block needs {count}. Connect block cap/skip, use force_rate=24, select_every_nth=1, format=None and no Meta Batch.")
-        return self._outputs(images, state, window)
+        prefix = min(39, window[2]) if state["plan"]["compatibility"].get("transfer_av") else 0
+        if int(images.shape[0]) != count + prefix:
+            raise ValueError(f"VHS loaded {int(images.shape[0])} frames; current block needs {count + prefix}. Connect block cap/skip, use force_rate=24, select_every_nth=1, format=None and no Meta Batch.")
+        source_prefix = images[:prefix].clone() if prefix else None
+        return self._outputs(images[prefix:].clone() if prefix else images, state, window, source_prefix)
 
 
 class SimpleH3SourceBlockPrompt:

@@ -22,6 +22,51 @@ spec.loader.exec_module(nodes)
 
 
 class SourceBlockTests(unittest.TestCase):
+    def test_transfer_av_real_preroll_and_no_intermediate_tail_padding(self):
+        for total in (120, 244, 310, 482, 720, 721):
+            raw = json.loads(nodes._source_plan(total, 'source', 'Transfer', 10, 0, 6,
+                                                transfer_av=True)[0])
+            self.assertEqual(raw['source_timeline'], 'masked_av')
+            self.assertEqual(sum(s['delivered_frames'] for s in raw['shots']), total)
+            timeline = torch.arange(total).reshape(total, 1, 1, 1)
+            delivered = []
+            start = 0
+            for index, shot in enumerate(raw['shots'], 1):
+                state = self.state(raw, index)
+                state['plan']['compatibility'].update(anchor_mode='head', context_length=39,
+                    audio_context_length=39, transfer_av=True)
+                cap, skip = nodes.SimpleH3SourceVideoVHSParams().parameters(state)
+                prefix = 39 if index > 1 else 0
+                self.assertEqual((skip, cap), (start - prefix, shot['delivered_frames'] + prefix))
+                loaded = timeline[skip:skip + cap]
+                result = nodes.SimpleH3SourceVideoLoadedBlock().prepare(loaded, state)
+                current, encoded = result[:2]
+                self.assertTrue(torch.equal(current, timeline[start:start + len(current)]))
+                if prefix:
+                    self.assertTrue(torch.equal(encoded[:39], timeline[start - 39:start]))
+                    self.assertEqual(int(encoded[39]), start)
+                if index < len(raw['shots']):
+                    self.assertEqual(len(encoded), len(current) + prefix)
+                direct = nodes.SimpleH3SourceVideoBlock().slice(timeline, state)
+                self.assertTrue(torch.equal(direct[1], encoded))
+                self.assertEqual(result[3], max(1.0, len(current) / 24))
+                self.assertLessEqual(cap, 300)
+                delivered.append(current)
+                start += len(current)
+            self.assertTrue(torch.equal(torch.cat(delivered), timeline))
+
+    def test_transfer_av_selection_invalidates_source_plan(self):
+        prompt = {'source': {'class_type':'SimpleH3SourceVideoVHSPlan', 'inputs':{}},
+                  'context': {'class_type':'SimpleH3ChainContext',
+                              'inputs':{'state':['source',0], 'context_type':'transfer_av'}}}
+        with patch.object(nodes.SimpleH3SourceVideoVHSPlan, '_selected_path', return_value=Path('source')), \
+             patch.object(nodes, '_video_signature', return_value='same-source'):
+            transfer = nodes.SimpleH3SourceVideoVHSPlan.IS_CHANGED(prompt=prompt, unique_id='source')
+            self.assertTrue(nodes.SimpleH3SourceVideoVHSPlan._masked_context(prompt, 'source', False))
+            prompt['context']['inputs']['context_type'] = 'masked_av'
+            masked = nodes.SimpleH3SourceVideoVHSPlan.IS_CHANGED(prompt=prompt, unique_id='source')
+            self.assertNotEqual(transfer, masked)
+
     def test_continuation_uses_accepted_first_and_previous_prompts(self):
         plan = json.loads(nodes._source_plan(720, 'source', 'Transfer', 10, 0, 6, masked_av=True)[0])
         state = self.state(plan, 3)
@@ -114,19 +159,26 @@ class SourceBlockTests(unittest.TestCase):
             gen = generate(str(path), 24, cap, skip, 1)
             info = next(gen)
             return torch.from_numpy(np.stack(list(gen))), {'loaded_fps': 24, 'source_duration': info[3]}
-        for rate in (24, 25, 30):
-            with self.subTest(rate=rate), tempfile.TemporaryDirectory() as temporary:
+        for rate, transfer in ((r, t) for r in (24, 25, 30) for t in (False, True)):
+            with self.subTest(rate=rate, transfer=transfer), tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / 'source.mkv'
                 subprocess.run([nodes._video_tools()[0], '-v', 'error', '-nostdin', '-f', 'lavfi', '-i',
                     f'testsrc=size=16x16:rate={rate}', '-frames:v', str(rate * 25 + 1), '-c:v', 'ffv1', str(path)],
                     check=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 first, info = load(path, 1)
                 self.assertEqual(len(first), 1)
-                raw, count, _, _, _ = nodes.SimpleH3SourceVideoVHSPlan().build(str(path), info, 30, 'Transfer')
+                prompt = {'source': {'class_type': 'SimpleH3SourceVideoVHSPlan', 'inputs': {}},
+                          'context': {'class_type': 'SimpleH3ChainContext', 'inputs': {
+                              'state': ['source', 0], 'context_type': 'transfer_av' if transfer else 'source_control_cut'}}}
+                raw, count, _, _, _ = nodes.SimpleH3SourceVideoVHSPlan().build(
+                    str(path), info, 30, 'Transfer', prompt=prompt, unique_id='source')
                 plan = json.loads(raw)
                 blocks = []
                 for index in range(1, count + 1):
                     state = self.state(plan, index)
+                    if transfer:
+                        state['plan']['compatibility'].update(anchor_mode='head', context_length=39,
+                            audio_context_length=39, transfer_av=True)
                     cap, skip = nodes.SimpleH3SourceVideoVHSParams().parameters(state)
                     images, _ = load(path, cap, skip)
                     blocks.append(nodes.SimpleH3SourceVideoLoadedBlock().prepare(images, state)[0])
@@ -314,6 +366,13 @@ class SourceBlockTests(unittest.TestCase):
             AUDIO_MODES=('generated_audio',))
         functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'native-plan', 'exec'), scope)
+        transfer = nodes._source_plan(720, 'source', 'Transfer', 10, 0, 6, transfer_av=True)[0]
+        normalized_transfer = scope['_normalize_plan'](transfer, 'Sexy AI Studio/Tests/TransferAV',
+            320, 320, 39, 'video', 'head', 'disabled', 'generated_audio', 39, 10, 6, 0, 18,
+            compensate_final_overlap_loss=True)
+        self.assertEqual(normalized_transfer['total_delivered_frames'], 720)
+        self.assertEqual([s['delivered_frames'] for s in normalized_transfer['shots']], [243, 238, 239])
+        self.assertEqual([s['raw_frames'] for s in normalized_transfer['shots']], [243, 277, 294])
         masked = nodes._source_plan(601, 'source', 'Transfer', 10, 0, 6, masked_av=True)[0]
         normalized = scope['_normalize_plan'](masked, 'Sexy AI Studio/Tests/SourceAV',
             320, 320, 39, 'video', 'head', 'disabled', 'generated_audio', 39, 10, 6, 0, 18,

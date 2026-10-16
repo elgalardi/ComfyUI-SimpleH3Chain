@@ -254,7 +254,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             return "5", requested
         if requested == "source_edit_contiguous":
             return "39", requested
-        if requested in ("masked_av", "masked_cut"):
+        if requested in ("masked_av", "transfer_av", "masked_cut"):
             return "39", requested
         # Migrate workflows saved with the retired context modes. Cinematic
         # Cuts keeps only a weak visual state reference and begins a fresh
@@ -297,13 +297,13 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         context_frames, context_type = self._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type == "masked_av":
+        if context_type in ("masked_av", "transfer_av"):
             context_frames = "39"
         audio_context = self._audio_context_value(
             context_frames, context_type, audio_context_frames
         )
         cut_reference = context_type in ("cut_reference", "masked_cut")
-        masked_context = context_type == "masked_av"
+        masked_context = context_type in ("masked_av", "transfer_av")
         if cut_reference:
             # Visual delivery is a clean cut, but the generated soundtrack keeps
             # a tested 22-frame tail. Five is the smallest native storage window
@@ -380,6 +380,8 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         )
         result[0]["base_preview"] = bool(base_preview)
         result[0]["compatibility"]["base_preview"] = bool(base_preview)
+        if context_type == "transfer_av":
+            result[0]["compatibility"]["transfer_av"] = True
         if delivery_width is not None:
             result[0]["compatibility"].update(
                 delivery_width=delivery_width, delivery_height=delivery_height)
@@ -541,6 +543,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                 }),
                 "context_type": ([
                     "masked_av",
+                    "transfer_av",
                     "masked_cut",
                     "storyboard_ref2va",
                     "storyboard_fl2va_continuous_audio",
@@ -551,7 +554,9 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                     "default": "masked_av",
                     "tooltip": (
                         "masked_av preserves an exact 39-frame latent AV prefix for "
-                        "the strongest same-shot continuation. masked_cut uses only "
+                        "the strongest same-shot continuation. transfer_av retains that "
+                        "AV prefix while loading real source pre-roll for video transfer, "
+                        "instead of repeating a still frame at each block boundary. masked_cut uses only "
                         "the last accepted visual state as a weak identity/look guide "
                         "before the new timeline; it creates a real camera cut with no "
                         "protected AV prefix or overlap compensation. "
@@ -568,7 +573,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                 "audio_feather_ticks": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
                     "tooltip": (
-                        "Used only by masked_av. Smoothly releases the final audio "
+                        "Used by masked_av and transfer_av. Smoothly releases the final audio "
                         "context edge. 8 ticks equals 0.2 seconds at H3's 40 Hz "
                         "audio latent rate; 0 uses a hard boundary."
                     ),
@@ -616,7 +621,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
         context_frames, context_type = SimpleH3ChainPlan._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type == "masked_av":
+        if context_type in ("masked_av", "transfer_av"):
             context_frames = "39"
         cut_reference = context_type in ("cut_reference", "masked_cut")
         requested_audio = SimpleH3ChainPlan._audio_context_value(
@@ -632,7 +637,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             - int(current_shot["delivered_frames"]),
         )
         external_first = index == 1 and bool(state.get("external_context"))
-        if context_type == "masked_av" and external_first:
+        if context_type in ("masked_av", "transfer_av") and external_first:
             # Imported media has no original sampler latent to copy. Seed the
             # first generated scene through the established VAE-guide path;
             # subsequent generated scenes switch to lossless masked AV.
@@ -676,7 +681,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             raise ValueError("Simple H3 context has no previous scene frames.")
 
         cfg = plan["compatibility"]
-        if context_type == "masked_av":
+        if context_type in ("masked_av", "transfer_av"):
             previous_latent = state.get("previous_latent")
             if previous_latent is None:
                 raise ValueError("Masked AV Continuation has no previous sampled H3 latent.")

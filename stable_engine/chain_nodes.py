@@ -2590,7 +2590,7 @@ class MiniMaxH3ChainSegmentSave:
             fingerprint = str(
                 plan.get("compatibility", {}).get("generation_fingerprint") or ""
             )
-            if "type=masked_av" in fingerprint:
+            if any(f"type={mode}" in fingerprint for mode in ("masked_av", "transfer_av")):
                 raw_waveform = audio.get("_simple_h3_raw_waveform")
                 raw_audio_frames = int(
                     audio.get("_simple_h3_raw_frames", shot["raw_frames"])
@@ -3527,7 +3527,7 @@ def _generated_audio(manifest: dict[str, Any]) -> dict[str, Any]:
     fingerprint = str(
         manifest.get("compatibility", {}).get("generation_fingerprint") or ""
     )
-    if "type=masked_av" not in fingerprint:
+    if not any(f"type={mode}" in fingerprint for mode in ("masked_av", "transfer_av")):
         return {"waveform": torch.cat(waveforms, dim=-1),
                 "sample_rate": int(sample_rate)}
 

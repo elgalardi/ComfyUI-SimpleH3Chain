@@ -88,6 +88,14 @@ class TwoPassTests(unittest.TestCase):
         prompt['235']['class_type'] = 'SimpleH3UltimateUpscaleAdvanced'
         advanced = cls().build(**args, delivery_width=832, delivery_height=448, prompt=prompt)[0]
         self.assertEqual(advanced['plan_hash'], protected['plan_hash'])
+        prompt['context'] = {'class_type': 'SimpleH3ChainContext',
+                             'inputs': {'context_type': 'transfer_av'}}
+        transfer = cls().build(**args, prompt=prompt)[0]
+        self.assertTrue(transfer['compatibility']['transfer_av'])
+        self.assertIn('type=transfer_av', transfer['plan_hash'])
+        self.assertEqual(cls._director_context('cut', 'transfer_av', 'Continuous Story'),
+                         ('39', 'transfer_av'))
+        self.assertNotIn('transfer_av', old['compatibility'])
 
     def test_existing_video_preserves_base_tail_and_plan(self):
         calls = []

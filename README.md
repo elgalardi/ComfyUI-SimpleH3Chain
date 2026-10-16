@@ -121,7 +121,19 @@ real frames to Driven and its H3-padded frames to the VAE. Both VHS loaders must
 The final block loads only the remaining real frames. VHS/OpenCV traverses skipped
 frames, so later blocks can take longer than the seek-based file loader below.
 
-For continuous source edits choose `masked_av` / audio `match_video` in Context.
+For source-motion transfer choose `transfer_av` / audio `match_video` in Context.
+This mode keeps the protected 39-frame generated AV/HQ prefix, but VHS loads the
+real preceding source frames together with each new block. Driven receives only
+the new real window; `encode_frames` includes the real pre-roll for Ref2VA and
+VAE encoding. Intermediate block lengths snap near the requested duration to the
+native H3 grid, avoiding frozen tail padding in the next context. Only the final
+block can have tail padding, excluded from delivery. Source timing and total
+duration remain exact; a nominal 10-second block is not always exactly 240 frames.
+No full-source decode, extra LLM call, SAM or ControlNet is introduced. Start in a
+new output folder after switching modes; generated motion/audio still require
+visual testing and are not guaranteed seamless.
+
+For the unchanged continuous source-edit behavior choose `masked_av` / audio `match_video` in Context.
 VHS Block Plan automatically follows its connected chain's Context mode, even if
 its standalone `masked_av` fallback widget is stale. Each continuation generates an extra
 39-frame protected AV prefix without moving the source block boundaries. Prepare
