@@ -22,6 +22,80 @@ spec.loader.exec_module(nodes)
 
 
 class SourceBlockTests(unittest.TestCase):
+    def test_requested_block_count_preserves_total_without_tiny_extra_blocks(self):
+        for seconds in (10, 20, 30):
+            for count in (1, 2, 3, 5, 24, 100):
+                with self.subTest(seconds=seconds, count=count):
+                    total = seconds * 24 * count
+                    result = nodes._source_plan(total + 1000, 'source', 'Transfer', seconds, 0, 6,
+                                                transfer_av=True, max_blocks=count)
+                    shots = json.loads(result[0])['shots']
+                    self.assertEqual(len(shots), count)
+                    self.assertEqual(sum(s['delivered_frames'] for s in shots), total)
+                    self.assertEqual(result[2], seconds * count)
+                    start = 0
+                    for index, shot in enumerate(shots):
+                        self.assertEqual(shot['audio_start_frame'], start)
+                        prefix = 39 if index else 0
+                        self.assertEqual(shot['length'] % 17, 5)
+                        self.assertGreaterEqual(shot['length'], shot['delivered_frames'] + prefix)
+                        start += shot['delivered_frames']
+                        if index < count - 1:
+                            self.assertEqual(shot['length'], shot['delivered_frames'] + prefix)
+                            self.assertLessEqual(abs(start - (index + 1) * seconds * 24), 9)
+                    self.assertLessEqual(abs(shots[-1]['delivered_frames'] - seconds * 24), 9)
+
+    def test_block_count_stops_at_source_end(self):
+        for total in (120, 310, 720, 1149):
+            for transfer in (False, True):
+                result = nodes._source_plan(total, 'source', 'Transfer', 20, 0, 6,
+                    transfer_av=transfer, max_blocks=3)
+                shots = json.loads(result[0])['shots']
+                self.assertLessEqual(len(shots), 3)
+                self.assertEqual(sum(s['delivered_frames'] for s in shots), total)
+                self.assertEqual(result[2], total / 24)
+
+    def test_zero_block_limit_keeps_existing_plan(self):
+        for transfer in (False, True):
+            original = nodes._source_plan(2401, 'source', 'Transfer', 20, 0, 6, transfer_av=transfer)
+            explicit = nodes._source_plan(2401, 'source', 'Transfer', 20, 0, 6,
+                transfer_av=transfer, max_blocks=0)
+            self.assertEqual(original, explicit)
+
+    def test_limited_blocks_keep_vhs_loading_frame_exact(self):
+        total = 20 * 24 * 3
+        raw = json.loads(nodes._source_plan(total, 'source', 'Transfer', 20, 0, 6,
+            transfer_av=True, max_blocks=3)[0])
+        timeline = torch.arange(total).reshape(total, 1, 1, 1)
+        delivered = []
+        for index in range(1, 4):
+            state = self.state(raw, index)
+            state['plan']['compatibility'].update(anchor_mode='head', context_length=39,
+                audio_context_length=39, transfer_av=True)
+            cap, skip = nodes.SimpleH3SourceVideoVHSParams().parameters(state)
+            current, encoded = nodes.SimpleH3SourceVideoLoadedBlock().prepare(timeline[skip:skip + cap], state)[:2]
+            self.assertEqual(len(encoded), raw['shots'][index - 1]['length'])
+            self.assertLessEqual(cap, 20 * 24 + 39 + 9)
+            delivered.append(current)
+        self.assertTrue(torch.equal(torch.cat(delivered), timeline))
+
+    def test_metadata_block_count_uses_only_ffprobe(self):
+        metadata = {'streams': [{'width': 640, 'height': 360, 'duration': '65'}], 'format': {'duration': '65'}}
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata).encode())
+        cls = nodes.SimpleH3SourceVideoVHSMetadataPlan
+        with patch.object(cls, '_selected_path', return_value=Path('source.mp4')), \
+             patch.object(cls, '_masked_context', return_value=True), \
+             patch.object(cls, '_transfer_context', return_value=True), \
+             patch.object(nodes, '_video_signature', return_value='source'), \
+             patch.object(nodes, '_video_tools', return_value=('ffmpeg', 'ffprobe')), \
+             patch.object(nodes.subprocess, 'run', return_value=response) as probe, \
+             patch.object(nodes, '_decode_video_window', side_effect=AssertionError('Must not decode frames')):
+            result = cls().build(max_seconds=0, seconds_per_block=20, max_blocks=3)
+        self.assertEqual(result[1:3], (3, 60.0))
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(probe.call_args.args[0][0], 'ffprobe')
+        self.assertEqual(cls.INPUT_TYPES()['optional']['max_blocks'][1]['default'], 0)
+
     def test_transfer_av_real_preroll_and_no_intermediate_tail_padding(self):
         for total in (120, 244, 310, 482, 720, 721):
             raw = json.loads(nodes._source_plan(total, 'source', 'Transfer', 10, 0, 6,

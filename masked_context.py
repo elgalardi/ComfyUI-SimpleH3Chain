@@ -143,6 +143,41 @@ def _audio_feather(mask, audio_steps: int, feather_ticks: int):
         mask[..., hard:audio_steps] = ramp.view(*shape)
 
 
+def composed_memory_start(steps, source_head_frames=0):
+    """Select a reusable five-frame phase-0 window near the delivered quarter."""
+    candidates = [start for start in range(0, int(steps) - 12, 5)
+                  if _pixel_frames(start) >= int(source_head_frames)]
+    if not candidates:
+        return None
+    desired_frame = int(source_head_frames) + 0.25 * (
+        _pixel_frames(steps) - int(source_head_frames))
+    return min(candidates, key=lambda value: abs(_pixel_frames(value) - desired_frame))
+
+
+def compose_previous_av_context(source_latent, source_head_frames=0, memory_video=None):
+    """Build a native 5+34 picture prefix; leave predecessor audio untouched."""
+    video, audio = _streams(source_latent)
+    steps = int(video.shape[2])
+    # Five frames occupy phase-0 steps [0:2]; the following 34 frames occupy
+    # phase-2 steps [2:12]. Full H3 clips end on phase 2, so their last ten
+    # steps match that second window without VAE decode/re-encode.
+    if steps % 5 != 2:
+        raise ValueError("Composed AV requires a complete native H3 video latent (17k+5 frames).")
+    start = composed_memory_start(steps, source_head_frames)
+    if memory_video is None and start is None:
+        _LOG.info("Simple H3 composed AV: no separate earlier window; using the original 39-frame tail.")
+        return source_latent
+    memory = video[:, :, start:start + 2] if memory_video is None else memory_video.to(
+        device=video.device, dtype=video.dtype)
+    composed = source_latent.copy()
+    composed['samples'] = [torch.cat((memory, video[:, :, -10:]), dim=2), audio]
+    _LOG.info(
+        "Simple H3 composed AV: 5 frames from %s + 34 recent tail frames; audio tail unchanged.",
+        'scene 1' if memory_video is not None else
+        'previous scene at delivered frame %d' % (_pixel_frames(start) - int(source_head_frames)))
+    return composed
+
+
 def apply_masked_av_continuation(
     target_latent, source_latent, context_frames=39, audio_feather_ticks=8
 ):

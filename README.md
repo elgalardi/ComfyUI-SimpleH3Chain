@@ -4,6 +4,45 @@ Focused orchestration for the current Ref2VA, FL2VA and still-image workflows.
 Native MiniMax H3 model loading, conditioning, sampling and decoding remain
 unchanged. Context Loop does not need to be installed separately.
 
+## Experimental composed AV context
+
+On **Simple H3 Context**, select `context_type=composed_av` to compare with
+`masked_av`. Existing connections stay unchanged; use a new output/run name
+because context mode is part of checkpoint identity. Restart ComfyUI and refresh
+the browser to load the appended mode. No director/LLM change is required.
+
+The picture prefix remains 39 frames: a native 5-frame window near the first
+quarter of the previous scene's delivered footage, followed by its exact final
+34 frames. Selection is temporal, not a detector of wide shots, clothing or
+scene changes. The windows are copied from the saved base sampled latent with
+matching H3 phases; no full RGB decode, VAE re-encode or additional sampling pass
+is introduced. Audio retains the original uninterrupted 39-frame tail and its
+existing feathering. The entire composed prefix is trimmed once from delivery.
+
+The first scene stays unchanged. Imported first-scene context uses the existing
+guide route; composition starts after a generated scene. Short history without
+a separate native earlier window falls back to ordinary masked AV. Existing
+checkpoints retain full base latents, so continuation/resume uses the same
+selection without a new persistent tensor cache. The HQ pass still protects its
+normal recent HQ tail rather than composing or re-decoding earlier HQ footage.
+
+The appended **composed_memory** selector defaults to `Previous Scene` (unchanged).
+Choose `First Scene` to use scene 1's earlier five-frame window from scene 3 onward,
+while the immediate predecessor still supplies the final 34 picture frames and
+all carried audio. Scene 2 uses the normal composed context. The first checkpoint
+is integrity-checked and only the small video window is materialized; no full RGB
+decode or persistent tensor cache. Resume uses that same saved active-lineage scene.
+Use a new run name after switching this selector. Keep `Previous Scene` for stories
+whose wardrobe/location intentionally evolves: First Scene is a fixed visual anchor,
+not an automatic detector of narrative changes.
+
+This is a fixed two-window experiment, not Context Loop's full arbitrary-source
+builder or an assistant. It may recover appearance outside the last camera
+view, but can also reinforce outdated wardrobe/location or weaken continuity.
+Compare short runs with the same positive seed; return to `masked_av` if joins
+or intentional appearance/location changes worsen. No paid model test has been
+run as part of this implementation.
+
 ## Included nodes (27)
 
 - Scene chain: `SimpleH3ChainPlan`, `SimpleH3ChainLoopStart`,
@@ -162,3 +201,5 @@ The uploaded/decoded IMAGE-batch nodes below remain available, but do not avoid 
 `Source Video — Block Plan` partitions a decoded **24 fps** IMAGE batch into exact source windows (default: 10 seconds). `Source Video — Current Block` sends only the current real window to Driven and a tail-padded, H3-valid version of that same window to the VAE. Use `source_control_cut` with audio context off; this source-timeline path does not add the 39-frame extension overlap. Delivery Trim removes the grid-padding tail, including on a short final block.
 
 Run the director inside the loop with Scenes=1, Hold=false and Cut=false. `Source Block — Director Prompt` extracts its one scene prompt and records the actual text in checkpoint state. The original request identifies the resumable plan; saved prompt/media/checkpoint artifacts retain their integrity checks. Source content fingerprints distinguish videos with identical dimensions and frame counts. Each block executes its own director analysis/generation, so API usage grows with block count. Generated audio remains supported; copying the source soundtrack is a separate workflow choice.
+
+For original-audio conditioning, `Prepare Loaded AV Block` accepts the **same block VHS loader's AUDIO output**. One `use_video_audio` switch can control that node and final assembly. Enabled, `guide_audio` includes VHS's existing skip/cap and transfer pre-roll, with only native-grid tail silence added; connect it to the base native `MiniMax H3 Add Guide` audio input. `Audio Guide — Optional Native Add Guide` applies that same audio to HQ conditioning without adding another video guide. Disabled or without a source audio stream, it passes conditioning through unchanged. Original-audio final assembly uses the source soundtrack from the beginning up to delivered duration; this is independent of the current loop block's offset. No extra video frames or director API calls are required. Audio guidance is conditioning, not a guarantee of exact generated lip sync.

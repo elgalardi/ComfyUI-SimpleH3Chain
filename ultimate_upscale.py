@@ -478,7 +478,7 @@ def trim_keyframe(kf, f0, f1):
     if has_a:
         rt = audio_latent.shape[-1]
         a_start = max(0, math.ceil((f0 - idx) * FRAME_RESCALE))
-        a_end = min(rt, math.floor((f1 - idx) / FRAME_RESCALE))
+        a_end = min(rt, math.floor((f1 - idx) * FRAME_RESCALE))
         if a_end > a_start:
             out["audio_latent"] = audio_latent[..., a_start:a_end].contiguous()
             if "resolved_frame_index" not in out:
@@ -1891,7 +1891,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
             cfg_plan = state["plan"]["compatibility"]
             context_frames = int(cfg_plan["context_length"])
             fingerprint = str(cfg_plan.get("generation_fingerprint", ""))
-            masked_chain = any(f"type={mode}" in fingerprint for mode in ("masked_av", "transfer_av"))
+            masked_chain = any(f"type={mode}" in fingerprint for mode in ("masked_av", "transfer_av", "composed_av"))
             previous = state.get("previous_refined_latent") if masked_chain else None
             if previous is not None:
                 parts = previous["samples"]

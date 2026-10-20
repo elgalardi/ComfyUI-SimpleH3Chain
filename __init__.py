@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import folder_paths
 import comfy.sd
 import comfy.utils
+from safetensors import safe_open
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
 
 from .stable_engine import chain_nodes as _chain
@@ -34,10 +35,13 @@ from .image_nodes import (
 from .masked_context import (
     apply_masked_av_continuation,
     apply_masked_video_continuation,
+    compose_previous_av_context,
+    composed_memory_start,
 )
 from .long_edit_nodes import (
     NODE_CLASS_MAPPINGS as _LONG_EDIT_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as _LONG_EDIT_NODE_DISPLAY_NAME_MAPPINGS,
+    _source_audio_from_vhs,
 )
 
 
@@ -206,10 +210,22 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         after the user switches the Context node to video (or vice versa).
         """
         return hashlib.sha256(json.dumps(
-            (cls._context_configuration(prompt), cls._has_refined_continuity(prompt)),
+            (cls._context_configuration(prompt), cls._has_refined_continuity(prompt),
+             cls._composed_memory_configuration(prompt)),
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _composed_memory_configuration(prompt):
+        if isinstance(prompt, dict):
+            values = {node.get('inputs', {}).get('composed_memory', 'Previous Scene')
+                      for node in prompt.values() if isinstance(node, dict)
+                      and node.get('class_type') == 'SimpleH3ChainContext'
+                      and node.get('inputs', {}).get('context_type') == 'composed_av'}
+            if 'First Scene' in values:
+                return 'First Scene'
+        return 'Previous Scene'
 
     @staticmethod
     def _has_refined_continuity(prompt):
@@ -254,7 +270,7 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             return "5", requested
         if requested == "source_edit_contiguous":
             return "39", requested
-        if requested in ("masked_av", "transfer_av", "masked_cut"):
+        if requested in ("masked_av", "transfer_av", "composed_av", "masked_cut"):
             return "39", requested
         # Migrate workflows saved with the retired context modes. Cinematic
         # Cuts keeps only a weak visual state reference and begins a fresh
@@ -297,13 +313,13 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
         context_frames, context_type = self._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type in ("masked_av", "transfer_av"):
+        if context_type in ("masked_av", "transfer_av", "composed_av"):
             context_frames = "39"
         audio_context = self._audio_context_value(
             context_frames, context_type, audio_context_frames
         )
         cut_reference = context_type in ("cut_reference", "masked_cut")
-        masked_context = context_type in ("masked_av", "transfer_av")
+        masked_context = context_type in ("masked_av", "transfer_av", "composed_av")
         if cut_reference:
             # Visual delivery is a clean cut, but the generated soundtrack keeps
             # a tested 22-frame tail. Five is the smallest native storage window
@@ -338,6 +354,8 @@ class SimpleH3ChainPlan(_chain.MiniMaxH3ChainPlan):
             f"audio_context={audio_context_frames}:feather={audio_feather_ticks}:"
             f"base_preview={int(bool(base_preview))}{cut_contract}"
         )
+        if context_type == 'composed_av' and self._composed_memory_configuration(prompt) == 'First Scene':
+            fingerprint += ':composed_memory=first_scene_v1'
         if (delivery_width is None) != (delivery_height is None):
             raise ValueError("Connect both delivery dimensions or neither.")
         if delivery_width is not None:
@@ -550,6 +568,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                     "source_edit_contiguous",
                     "source_control_cut",
                     "source_control_overlap_5",
+                    "composed_av",
                 ], {
                     "default": "masked_av",
                     "tooltip": (
@@ -568,12 +587,15 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                         "source_edit_contiguous is exclusive to long source-video "
                         "editing: it carries 39 decoded visual frames, trims them "
                         "from delivery, and keeps source audio on its exact timeline."
+                        " composed_av is experimental: 5 earlier frames plus the last 34 frames "
+                        "of the previous generated scene form the protected 39-frame picture prefix; "
+                        "audio remains the uninterrupted previous tail."
                     ),
                 }),
                 "audio_feather_ticks": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
                     "tooltip": (
-                        "Used by masked_av and transfer_av. Smoothly releases the final audio "
+                        "Used by masked_av, transfer_av and composed_av. Smoothly releases the final audio "
                         "context edge. 8 ticks equals 0.2 seconds at H3's 40 Hz "
                         "audio latent rate; 0 uses a hard boundary."
                     ),
@@ -587,6 +609,10 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
                     "forceInput": True,
                     "tooltip": "Join contract from the Multi-Storyboard Block Plan node.",
                 }),
+                "composed_memory": (["Previous Scene", "First Scene"], {
+                    "default": "Previous Scene",
+                    "tooltip": "Only composed_av: Previous Scene uses its earlier five-frame window. First Scene uses scene 1's saved five-frame window from scene 3 onward, retaining the immediate predecessor's final 34 frames and continuous audio. May reinforce outdated styling after deliberate changes.",
+                }),
             },
         }
 
@@ -596,10 +622,33 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
         "Masked latent ready for sampling. Connect this output to the sampler.",
     )
 
+    @staticmethod
+    def _first_scene_memory(state):
+        segment = next((item for item in state.get('segments', []) if int(item['index']) == 1), None)
+        if segment is None:
+            _chain._LOG.warning('Simple H3: scene 1 is unavailable; composed AV uses the previous scene.')
+            return None
+        path = _chain._absolute_output_path(segment['checkpoint'])
+        expected_hash = segment.get('checkpoint_sha256')
+        if expected_hash and _chain._file_sha256(path) != expected_hash:
+            raise ValueError('Composed AV scene 1 checkpoint failed its SHA-256 integrity check.')
+        head = max(0, int(segment['raw_frames']) - int(segment['delivered_frames']))
+        with safe_open(path, framework='pt', device='cpu') as checkpoint:
+            video = checkpoint.get_slice('video')
+            shape = video.get_shape()
+            temporal_axis = 2 if len(shape) == 5 else 1
+            start = composed_memory_start(shape[temporal_axis], head)
+            if start is None:
+                _chain._LOG.warning('Simple H3: scene 1 has no separate memory window; using the previous scene.')
+                return None
+            memory = (video[:, :, start:start + 2] if len(shape) == 5 else
+                      video[:, start:start + 2].unsqueeze(0))
+            return memory.clone()
+
     def apply(
         self, state, conditioning, vae, latent, context_frames,
         audio_context_frames, context_type, audio_feather_ticks=8, audio_vae=None,
-        block_config=None,
+        block_config=None, composed_memory="Previous Scene",
     ):
         if str(block_config or "").strip():
             try:
@@ -621,7 +670,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
         context_frames, context_type = SimpleH3ChainPlan._director_context(
             context_frames, context_type, director_mode
         )
-        if context_type in ("masked_av", "transfer_av"):
+        if context_type in ("masked_av", "transfer_av", "composed_av"):
             context_frames = "39"
         cut_reference = context_type in ("cut_reference", "masked_cut")
         requested_audio = SimpleH3ChainPlan._audio_context_value(
@@ -637,7 +686,7 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             - int(current_shot["delivered_frames"]),
         )
         external_first = index == 1 and bool(state.get("external_context"))
-        if context_type in ("masked_av", "transfer_av") and external_first:
+        if context_type in ("masked_av", "transfer_av", "composed_av") and external_first:
             # Imported media has no original sampler latent to copy. Seed the
             # first generated scene through the established VAE-guide path;
             # subsequent generated scenes switch to lossless masked AV.
@@ -681,10 +730,16 @@ class SimpleH3ChainContext(_chain.MiniMaxH3ChainContext):
             raise ValueError("Simple H3 context has no previous scene frames.")
 
         cfg = plan["compatibility"]
-        if context_type in ("masked_av", "transfer_av"):
+        if context_type in ("masked_av", "transfer_av", "composed_av"):
             previous_latent = state.get("previous_latent")
             if previous_latent is None:
                 raise ValueError("Masked AV Continuation has no previous sampled H3 latent.")
+            if context_type == 'composed_av':
+                previous_shot = plan['shots'][index - 2]
+                previous_head = max(0, int(previous_shot['raw_frames']) - int(previous_shot['delivered_frames']))
+                memory = self._first_scene_memory(state) if composed_memory == 'First Scene' and index > 2 else None
+                previous_latent = (compose_previous_av_context(previous_latent, previous_head, memory)
+                                   if memory is not None else compose_previous_av_context(previous_latent, previous_head))
             masked_latent, trim = apply_masked_av_continuation(
                 latent, previous_latent, 39, audio_feather_ticks
             )
@@ -981,7 +1036,16 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
                         "when the base final itself is only a temporary preview."
                     ),
                 }),
+                "use_video_audio": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "True uses the original soundtrack of the video selected in the upstream VHS loader, "
+                        "trimmed to the final duration. False keeps the plan's audio (normally generated H3 audio). "
+                        "Does not change sampling or the director. A source without audio produces a silent final."
+                    ),
+                }),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
     @staticmethod
@@ -1066,11 +1130,23 @@ class SimpleH3ChainAssemble(_chain.MiniMaxH3ChainAssemble):
         remove()
 
     def assemble(self, manifest, filename, save_output, source_audio=None,
-                 preserve_recovery=False):
+                 preserve_recovery=False, use_video_audio=False, prompt=None, unique_id=None):
         final_name = _versioned_final_name(manifest, filename)
+        audio_source = "plan"
+        assembly_manifest = manifest
+        if use_video_audio:
+            source_audio = _source_audio_from_vhs(
+                prompt, unique_id, int(manifest["total_delivered_frames"]) / float(_chain.FPS))
+            if source_audio is None:
+                audio_source = "none"
+                _chain._LOG.warning("Original video has no audio track; the final video will be silent.")
+            else:
+                audio_source = "source"
+                assembly_manifest = dict(manifest, compatibility=dict(manifest["compatibility"],
+                    source_audio_hash=_chain._audio_fingerprint(source_audio)))
         result = super().assemble(
-            manifest=manifest,
-            audio_source="plan",
+            manifest=assembly_manifest,
+            audio_source=audio_source,
             filename=final_name,
             audio_bitrate=256,
             source_audio=source_audio,

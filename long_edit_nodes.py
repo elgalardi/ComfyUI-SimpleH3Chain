@@ -13,12 +13,16 @@ import torch
 import folder_paths
 
 
-def _source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av=False, transfer_av=False):
+def _source_plan(total, source_id, request, seconds_per_block, seed, steps, masked_av=False, transfer_av=False,
+                 max_blocks=0):
     seconds = float(seconds_per_block)
     if total < 1 or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("Source video needs frames and a positive finite block duration.")
     prompt = str(request or "").strip() or "Adapt the character references onto the source performance; preserve its action, camera and chronology."
     block = max(1, round(seconds * 24))
+    max_blocks = max(0, int(max_blocks))
+    if max_blocks:
+        total = min(total, block * max_blocks)
     masked_av = masked_av or transfer_av
     seed = int(seed) % (1 << 64)
     shots = []
@@ -26,7 +30,13 @@ def _source_plan(total, source_id, request, seconds_per_block, seed, steps, mask
     while start < total:
         delivered = min(block, total - start)
         prefix = 39 if masked_av and shots else 0
-        if transfer_av and total - start > block:
+        last_block = bool(max_blocks and len(shots) + 1 == max_blocks)
+        if last_block:
+            delivered = total - start
+        elif max_blocks:
+            # Aim at cumulative boundaries so native-grid rounding cannot accumulate in the last block.
+            delivered = min(total - start, max(1, block * (len(shots) + 1) - start))
+        if transfer_av and not last_block and total - start > delivered:
             # End intermediate blocks on the native grid, not in duplicated tail padding.
             aligned = max(56, 5 + 17 * round((delivered + prefix - 5) / 17))
             delivered = min(total - start, aligned - prefix)
@@ -65,6 +75,36 @@ def _video_path(video):
 def _video_signature(path):
     stat = path.stat()
     return hashlib.sha256(f"{path}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")).hexdigest()[:16]
+
+
+def _source_audio_from_vhs(prompt, unique_id, seconds):
+    loaders = [node for node_id, node in (prompt or {}).items()
+               if node.get("class_type") == "VHS_LoadVideo"
+               and SimpleH3SourceVideoVHSPlan._uses_source(prompt, unique_id, node_id)]
+    if len(loaders) != 1:
+        raise ValueError("Original video audio needs one upstream VHS Load Video (Upload).")
+    selected = loaders[0].get("inputs", {}).get("video")
+    if not isinstance(selected, str):
+        raise ValueError("Select the source video directly in VHS Load Video (Upload).")
+    path = Path(folder_paths.get_annotated_filepath(selected)).resolve()
+    if not path.is_relative_to(Path(folder_paths.get_input_directory()).resolve()) or not path.is_file():
+        raise ValueError("Select an existing input video for the original audio.")
+    ffmpeg, ffprobe = _video_tools()
+    process_options = {"capture_output": True, "check": True,
+                       "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    probe = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
+        "stream=index", "-of", "json", str(path)], **process_options)
+    if not json.loads(probe.stdout).get("streams"):
+        return None
+    result = subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", str(path),
+        "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", "aresample=48000:async=1:first_pts=0,apad", "-t", f"{float(seconds):.9f}",
+        "-ar", "48000", "-ac", "2", "-f", "f32le", "pipe:1"], **process_options)
+    waveform = torch.from_numpy(np.frombuffer(result.stdout, dtype=np.float32).copy()).reshape(-1, 2).T.unsqueeze(0)
+    samples = round(float(seconds) * 48000)
+    waveform = waveform[..., :samples]
+    if waveform.shape[-1] < samples:
+        waveform = torch.nn.functional.pad(waveform, (0, samples - waveform.shape[-1]))
+    return {"waveform": waveform.contiguous(), "sample_rate": 48000}
 
 
 def _decode_video_window(source, start, count):
@@ -315,7 +355,7 @@ class SimpleH3SourceVideoVHSPlan(SimpleH3SourceVideoPlan):
                  and SimpleH3SourceVideoVHSPlan._uses_source(prompt, node_id, unique_id)}
         if len(modes) > 1:
             raise ValueError("Source blocks need one Context mode per chain.")
-        return next(iter(modes)) in ("masked_av", "transfer_av") if modes else bool(fallback)
+        return next(iter(modes)) in ("masked_av", "transfer_av", "composed_av") if modes else bool(fallback)
 
     DESCRIPTION = "Plan from VHS source metadata, not its loaded frame count. Set VHS force_rate=24, select_every_nth=1 and format=None; the initial loader needs only one frame."
 
@@ -341,7 +381,9 @@ class SimpleH3SourceVideoVHSMetadataPlan(SimpleH3SourceVideoVHSPlan):
         fields.pop("video_info")
         return {"required": fields,
             "optional": {"canvas_width": ("INT", {"default": 420, "forceInput": True}),
-                         "canvas_height": ("INT", {"default": 420, "forceInput": True})},
+                         "canvas_height": ("INT", {"default": 420, "forceInput": True}),
+                         "max_blocks": ("INT", {"default": 0, "min": 0, "max": 10000, "forceInput": True,
+                             "tooltip": "Maximum blocks at the selected duration; 0 processes the available source. Stops earlier when the video ends. H3 grid rounding is balanced across blocks."})},
             "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = (*SimpleH3SourceVideoPlan.RETURN_TYPES, "INT", "INT")
@@ -364,7 +406,7 @@ class SimpleH3SourceVideoVHSMetadataPlan(SimpleH3SourceVideoVHSPlan):
         return path
 
     def build(self, max_seconds=30.0, request="", seconds_per_block=10.0, seed=0, steps=6, masked_av=False,
-              canvas_width=420, canvas_height=420, prompt=None, unique_id=None):
+              canvas_width=420, canvas_height=420, prompt=None, unique_id=None, max_blocks=0):
         path = self._selected_path(None, prompt, unique_id)
         _, ffprobe = _video_tools()
         result = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_streams", "-show_format", "-of", "json", str(path)],
@@ -384,7 +426,7 @@ class SimpleH3SourceVideoVHSMetadataPlan(SimpleH3SourceVideoVHSPlan):
         masked_av = self._masked_context(prompt, unique_id, masked_av)
         plan = _source_plan(math.floor(duration * 24 + 1e-6), _video_signature(path), request,
                             seconds_per_block, seed, steps, masked_av,
-                            self._transfer_context(prompt, unique_id))
+                            self._transfer_context(prompt, unique_id), max_blocks=max_blocks)
         return (*plan, width, height)
 
 
@@ -416,6 +458,59 @@ class SimpleH3SourceVideoLoadedBlock(SimpleH3SourceVideoBlock):
             raise ValueError(f"VHS loaded {int(images.shape[0])} frames; current block needs {count + prefix}. Connect block cap/skip, use force_rate=24, select_every_nth=1, format=None and no Meta Batch.")
         source_prefix = images[:prefix].clone() if prefix else None
         return self._outputs(images[prefix:].clone() if prefix else images, state, window, source_prefix)
+
+
+class SimpleH3SourceVideoLoadedAVBlock(SimpleH3SourceVideoLoadedBlock):
+    """Keep VHS's already-windowed audio aligned with the encoded block."""
+    RETURN_TYPES = SimpleH3SourceVideoLoadedBlock.RETURN_TYPES + ("AUDIO",)
+    RETURN_NAMES = SimpleH3SourceVideoLoadedBlock.RETURN_NAMES + ("guide_audio",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "state": ("H3_CHAIN_STATE",)},
+                "optional": {"source_audio": ("AUDIO", {"lazy": True}),
+                             "use_video_audio": ("BOOLEAN", {"default": False})}}
+
+    def check_lazy_status(self, images, state, source_audio=None, use_video_audio=False):
+        return ["source_audio"] if use_video_audio and source_audio is None else []
+
+    def prepare(self, images, state, source_audio=None, use_video_audio=False):
+        outputs = super().prepare(images, state)
+        if not use_video_audio:
+            return (*outputs, None)
+        if source_audio is None:
+            raise ValueError("Connect the current VHS block AUDIO output to source_audio.")
+        if source_audio.get("_vhs_no_audio", False):
+            return (*outputs, None)
+        rate = int(source_audio["sample_rate"])
+        if rate <= 0:
+            raise ValueError("VHS audio sample_rate must be positive.")
+        # VHS has already applied skip/cap, including transfer_av pre-roll.
+        # Only add native-frame-grid tail silence; never apply the offset twice.
+        length = round(int(outputs[2]) * rate / 24)
+        waveform = source_audio["waveform"][..., :length].clone()
+        if waveform.shape[-1] < length:
+            import torch.nn.functional as audio_functional
+            waveform = audio_functional.pad(waveform, (0, length - waveform.shape[-1]))
+        return (*outputs, {"waveform": waveform, "sample_rate": rate})
+
+
+class SimpleH3OptionalAudioGuide:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"positive": ("CONDITIONING",), "latent": ("LATENT",),
+                             "audio_vae": ("VAE",)}, "optional": {"audio": ("AUDIO",)}}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply"
+    CATEGORY = "MiniMax H3/Simple Chain"
+
+    def apply(self, positive, latent, audio_vae, audio=None):
+        if audio is None:
+            return (positive,)
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
+        return (MiniMaxH3AddGuide.execute(positive=positive, latent=latent,
+                frame_idx=0, audio_vae=audio_vae, audio=audio)[0],)
 
 
 class SimpleH3SourceBlockPrompt:
@@ -559,6 +654,8 @@ class SimpleH3CompactContinuousPlanJSON:
 
 
 NODE_CLASS_MAPPINGS = {
+    "SimpleH3SourceVideoLoadedAVBlock": SimpleH3SourceVideoLoadedAVBlock,
+    "SimpleH3OptionalAudioGuide": SimpleH3OptionalAudioGuide,
     "SimpleH3SourceVideoVHSMetadataPlan": SimpleH3SourceVideoVHSMetadataPlan,
     "SimpleH3SourceVideoVHSPlan": SimpleH3SourceVideoVHSPlan,
     "SimpleH3SourceVideoVHSParams": SimpleH3SourceVideoVHSParams,
@@ -572,6 +669,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SimpleH3SourceVideoLoadedAVBlock": "Simple H3 Source Video — Prepare Loaded AV Block",
+    "SimpleH3OptionalAudioGuide": "Simple H3 Audio Guide — Optional Native Add Guide",
     "SimpleH3SourceVideoVHSMetadataPlan": "Simple H3 Source Video — Metadata Only Plan",
     "SimpleH3SourceVideoVHSPlan": "Simple H3 Source Video — VHS Block Plan",
     "SimpleH3SourceVideoVHSParams": "Simple H3 Source Video — VHS Block Parameters",
