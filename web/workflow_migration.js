@@ -10,10 +10,16 @@ app.registerExtension({
     name: "SimpleH3Chain.workflowMigration",
     beforeConfigureGraph(graphData) {
         for (const node of graphData?.nodes ?? []) {
+            const values = node.widgets_values;
+            if (!Array.isArray(values)) continue;
+            if (node.type === "SimpleH3RemakeConditioning" || node.type === "SexyAIRemakeConditioning") {
+                // Old layout: prompt, pins, frames, width, height, optional detail limit.
+                if (typeof values[1] === "string") values.splice(1, 1);
+                continue;
+            }
             if (node.type !== "SimpleH3CompactContinuousPlanJSON") continue;
             // The former combo serialized seconds as a string, in the same slot.
-            const values = node.widgets_values;
-            if (Array.isArray(values) && typeof values[0] === "string") {
+            if (typeof values[0] === "string") {
                 const seconds = Number(values[0]);
                 if (Number.isFinite(seconds)) values[0] = seconds;
             }

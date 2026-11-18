@@ -565,7 +565,7 @@ class SimpleH3CompactContinuousPlanJSON:
                     "forceInput": True, "min": 1, "max": 12,
                 }),
                 "seconds_per_scene": ("FLOAT", {
-                    "default": 5.0, "min": 1.0, "max": 15.0, "step": 0.1,
+                    "default": 5.0, "min": 1.0, "max": 30.0, "step": 0.1,
                     "tooltip": "Nominal seconds per scene, including decimals. H3 frame-grid alignment and continuation context can change the delivered duration.",
                 }),
             },
@@ -605,8 +605,8 @@ class SimpleH3CompactContinuousPlanJSON:
                 f"scene_count requires exactly {count}. Disable Hold and regenerate."
             )
         seconds = float(seconds_per_scene)
-        if not math.isfinite(seconds) or not 1.0 <= seconds <= 15.0:
-            raise ValueError("Seconds per scene must be a finite number between 1 and 15.")
+        if not math.isfinite(seconds) or not 1.0 <= seconds <= 30.0:
+            raise ValueError("Seconds per scene must be a finite number between 1 and 30.")
         requested_frames = math.ceil(seconds * 24)
 
         def valid_at_or_above(value):
