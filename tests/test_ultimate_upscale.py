@@ -243,6 +243,29 @@ class UpscaleTests(unittest.TestCase):
                 self.assertGreater(len(result.result[1]), 1)
         self.assertTrue(any(torch.amin(mask).item() == 0 for mask in calls))
 
+    def test_external_upscaler_keeps_base_context_for_next_masked_scene(self):
+        torch = up.torch
+        from importlib.util import spec_from_file_location, module_from_spec
+        spec = spec_from_file_location('masked_external_test', ROOT / 'masked_context.py')
+        masked = module_from_spec(spec)
+        spec.loader.exec_module(masked)
+        base = {'samples': up.comfy.nested_tensor.NestedTensor((
+            torch.zeros(1, 24, 72, 4, 4), torch.zeros(1, 32, 2, 405)))}
+        high = {'samples': up.comfy.nested_tensor.NestedTensor((
+            torch.ones(1, 24, 72, 8, 8), torch.zeros(1, 32, 2, 405)))}
+        state = {'index': 1, 'plan': {'compatibility': {
+            'context_length': 39, 'generation_fingerprint': 'type=masked_av'}}}
+        with patch.object(up, 'sample_piece', side_effect=lambda piece, *a, **kw: piece['samples']):
+            result = up.SimpleH3UltimateUpscale.execute(
+                latent=high, base_context_latent=base, conditioning=[], model=SimpleNamespace(),
+                noise=up.Noise_RandomNoise(0), sampler=None, sigmas=torch.tensor([.2, 0.]), state=state)
+        context = result.result[3]
+        self.assertIs(context['samples'], base['samples'])
+        self.assertEqual(context['_simple_h3_refined_latent']['samples'].tensors[0].shape[-2:], (8, 8))
+        next_latent, trim = masked.apply_masked_av_continuation(base, context, 39, 8)
+        self.assertEqual(next_latent['samples'].tensors[0].shape[-2:], (4, 4))
+        self.assertEqual(int(trim), 39)
+
     def test_learned_model_is_loaded_once_per_execution_cache(self):
         class Resize(up.torch.nn.Module):
             def forward(self, x, scale, target_size):

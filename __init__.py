@@ -1747,3 +1747,8 @@ NODE_DISPLAY_NAME_MAPPINGS.update(_REMAKE_NAMES)
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 WEB_DIRECTORY = "./web"
+
+
+from .latent_upscale_2d import SimpleH3LatentUpscale2D
+NODE_CLASS_MAPPINGS["SimpleH3LatentUpscale2D"] = SimpleH3LatentUpscale2D
+NODE_DISPLAY_NAME_MAPPINGS["SimpleH3LatentUpscale2D"] = "Simple H3 Latent Upscale — Learned 2D"

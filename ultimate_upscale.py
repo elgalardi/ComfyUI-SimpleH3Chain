@@ -1828,6 +1828,8 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
                                        tooltip="Output of 'SimpleH3 Spatial Split Params'. Leave unconnected to sample each chunk whole (no tiling)."),
                 H3_CHAIN_STATE.Input("state", optional=True,
                                      tooltip="Current Scene state for protected previous-refined context in Masked AV scene chains."),
+                io.Latent.Input("base_context_latent", optional=True,
+                    tooltip="Original first-pass AV latent when an external upscaler already resized the sampling input. Keeps continuation at base resolution while storing a separate HQ tail."),
             ],
             outputs=[
                 io.Latent.Output("latent", tooltip="Upscaled, re-sampled, stitched MiniMax H3 AV latent."),
@@ -1844,8 +1846,14 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
     def execute(cls, latent, conditioning, model, noise, sampler, sigmas,
                 negative=None, cfg=1.0,
                 temporal_split_param=None, spatial_split_param=None,
-                latent_upscale_param=None, keep_model_loaded=True, state=None) -> io.NodeOutput:
+                latent_upscale_param=None, keep_model_loaded=True, state=None, base_context_latent=None) -> io.NodeOutput:
         samples = latent["samples"]
+        if base_context_latent is not None:
+            base_samples = base_context_latent.get("samples")
+            if not is_h3_av_latent(base_samples):
+                raise ValueError("base_context_latent must contain the original first-pass H3 AV latent.")
+            if not is_h3_av_latent(samples) or base_samples.tensors[0].shape[:3] != samples.tensors[0].shape[:3] or base_samples.tensors[1].shape != samples.tensors[1].shape:
+                raise ValueError("Base context and refinement input must have identical AV batch/channel/time geometry; only spatial resolution may differ.")
         if not is_h3_av_latent(samples):
             raise ValueError("SimpleH3UltimateUpscale expects a MiniMax H3 AV latent (nested video [B,24,T,H,W] + audio [B,32,2,T])")
         video = samples.tensors[0]
@@ -2011,7 +2019,7 @@ class SimpleH3UltimateUpscale(io.ComfyNode):
 
         out = {"samples": comfy.nested_tensor.NestedTensor((acc_v, acc_a))}
         upscale_models.clear()
-        context = dict(latent)
+        context = dict(base_context_latent if base_context_latent is not None else latent)
         if state is not None:
             tail_tokens = min(tokens_for_frames(context_frames), int(acc_v.shape[2]))
             audio_tokens = min(round(context_frames * FRAME_RESCALE), int(acc_a.shape[-1]))
@@ -2055,7 +2063,7 @@ class SimpleH3UltimateUpscaleAdvanced(SimpleH3UltimateUpscale):
                 sampler_name, scheduler, start_at_step, end_at_step,
                 return_with_leftover_noise, negative=None, temporal_split_param=None,
                 spatial_split_param=None, latent_upscale_param=None,
-                keep_model_loaded=True, state=None) -> io.NodeOutput:
+                keep_model_loaded=True, state=None, base_context_latent=None) -> io.NodeOutput:
         schedule = comfy.samplers.KSampler(
             model, steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=1.0)
         sigmas = schedule.sigmas.clone()
@@ -2070,4 +2078,4 @@ class SimpleH3UltimateUpscaleAdvanced(SimpleH3UltimateUpscale):
             sampler=comfy.samplers.sampler_object(sampler_name), sigmas=sigmas,
             negative=negative, cfg=cfg, temporal_split_param=temporal_split_param,
             spatial_split_param=spatial_split_param, latent_upscale_param=latent_upscale_param,
-            keep_model_loaded=keep_model_loaded, state=state)
+            keep_model_loaded=keep_model_loaded, state=state, base_context_latent=base_context_latent)
