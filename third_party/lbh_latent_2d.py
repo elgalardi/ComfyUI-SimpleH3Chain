@@ -763,7 +763,7 @@ def _detect_arch(sd):
         w = sd[conv_key]
         cfg["channels"] = w.shape[0]
         conv_in_ch = w.shape[1]
-        
+
         # 【关键修复】CoordConv2D 无参数，不在 state_dict 中
         # 通过 conv_in 输入通道数判断：26 = 24(latent) + 2(coord)
         # 同时检查 conv_out 输出通道数确认真实 latent 通道数
@@ -772,7 +772,7 @@ def _detect_arch(sd):
             real_in_channels = sd[conv_out_key].shape[0]  # conv_out 输出 = 真实 latent 通道数
         else:
             real_in_channels = 24  # fallback
-        
+
         if conv_in_ch == real_in_channels + 2:
             cfg["use_coord"] = True
             cfg["in_channels"] = real_in_channels
@@ -1133,5 +1133,3 @@ class MinimaxH3LatentUpscalerNode2D(io.ComfyNode):
             gc.collect()
 
         return io.NodeOutput({"samples": out})
-
-
